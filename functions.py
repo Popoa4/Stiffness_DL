@@ -340,7 +340,7 @@ class Model(nn.Module):
 
     def forward(self, x):
         # LSTM: Ensure the input is on the CPU for compatibility with MPS
-        return self.Decoder(self.EncoderCNN(x).to('cpu')).to('mps')
+        # return self.Decoder(self.EncoderCNN(x).to('cpu')).to('mps')
         # GRU: all on mps
         # transformer: all on mps
-        # return self.Decoder(self.EncoderCNN(x))
+        return self.Decoder(self.EncoderCNN(x))
