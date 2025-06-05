@@ -8,6 +8,7 @@ import torch.nn.functional as F
 import torchvision.models as models
 import torchvision.transforms as transforms
 from tqdm import tqdm
+import math
 
 ## ------------------- label conversion tools ------------------ ##
 def labels2cat(label_encoder, list):
@@ -166,11 +167,180 @@ class DecoderRNN(nn.Module):
         x = self.fc2(x)
         return x
 
-class Model(nn.Module):
-    def __init__(self, EncoderCNN, DecoderRNN):
+## -------------------- DecoderGRU module ---------------------- ##
+class DecoderGRU(nn.Module):
+    def __init__(self, CNN_embed_dim=256, h_RNN_layers=1, h_RNN=256, h_FC_dim=128, drop_p=0.3, num_classes=5):
+        super(DecoderGRU, self).__init__()
+        self.GRU = nn.GRU(input_size=CNN_embed_dim,
+                          hidden_size=h_RNN,
+                          num_layers=h_RNN_layers,
+                          batch_first=True)
+        self.fc1 = nn.Linear(h_RNN, h_FC_dim)
+        self.fc2 = nn.Linear(h_FC_dim, 1)
+        self.drop_p = drop_p
+
+    def forward(self, x_RNN):
+        RNN_out, _ = self.GRU(x_RNN)
+        x = self.fc1(RNN_out[:, -1, :])  # 取最后一个时间步
+        x = F.relu(x)
+        x = F.dropout(x, p=self.drop_p, training=self.training)
+        x = self.fc2(x)
+        return x
+
+## ------------------- Transformer module ---------------------- ##
+class PositionalEncoding(nn.Module):
+    def __init__(self, d_model, max_len=100):
         super().__init__()
-        self.EncoderCNN = EncoderCNN
-        self.DecoderRNN = DecoderRNN
+        # 创建位置编码矩阵
+        pe = torch.zeros(max_len, d_model)
+        position = torch.arange(0, max_len).unsqueeze(1).float()
+        div_term = torch.exp(torch.arange(0, d_model, 2).float() *
+                             (-math.log(10000.0) / d_model))
+        pe[:, 0::2] = torch.sin(position * div_term)
+        pe[:, 1::2] = torch.cos(position * div_term)
+        pe = pe.unsqueeze(0)
+        self.register_buffer('pe', pe)
 
     def forward(self, x):
-        return self.DecoderRNN(self.EncoderCNN(x).to('cpu')).to('mps')
+        # x: [batch, seq_len, features]
+        return x + self.pe[:, :x.size(1), :]
+
+
+class DecoderTransformer(nn.Module):
+    def __init__(self, CNN_embed_dim=256, nhead=4, num_layers=2, h_FC_dim=128, drop_p=0.3, num_classes=5):
+        super().__init__()
+        # 位置编码
+        self.pos_encoder = PositionalEncoding(CNN_embed_dim)
+
+        # 创建Transformer编码器层
+        encoder_layer = nn.TransformerEncoderLayer(
+            d_model=CNN_embed_dim,
+            nhead=nhead,
+            dim_feedforward=CNN_embed_dim * 4,
+            dropout=drop_p,
+            batch_first=True  # 重要：保持[batch, seq, feature]顺序
+        )
+
+        # 堆叠编码器层
+        self.transformer = nn.TransformerEncoder(encoder_layer, num_layers)
+
+        # 输出层
+        self.fc1 = nn.Linear(CNN_embed_dim, h_FC_dim)
+        self.fc2 = nn.Linear(h_FC_dim, 1)
+        self.drop_p = drop_p
+
+    def forward(self, x):
+        # 添加位置编码
+        x = self.pos_encoder(x)
+
+        # 通过Transformer (不需要mask，因为我们只取最后输出)
+        out = self.transformer(x)
+
+        # 取序列最后一个时间步
+        x = self.fc1(out[:, -1])
+        x = F.relu(x)
+        x = F.dropout(x, p=self.drop_p, training=self.training)
+        x = self.fc2(x)
+        return x
+
+## -------------------- Temporal Convolutional Network (TCN) module ---------------------- ##
+def Chomp1d(x, chomp_size):
+    """裁掉多余的 time step（右侧裁剪）"""
+    return x[:, :, :-chomp_size] if chomp_size > 0 else x
+
+class TemporalBlock(nn.Module):
+    def __init__(self, n_inputs, n_outputs, kernel_size, stride,
+                 dilation, padding, dropout=0.2):
+        super().__init__()
+        self.conv1 = nn.Conv1d(n_inputs, n_outputs, kernel_size,
+                               stride=stride, padding=padding, dilation=dilation)
+        self.chomp1 = lambda x: Chomp1d(x, padding)   # 关键
+        self.bn1   = nn.BatchNorm1d(n_outputs)
+        self.relu1 = nn.ReLU()
+        self.drop1 = nn.Dropout(dropout)
+
+        self.conv2 = nn.Conv1d(n_outputs, n_outputs, kernel_size,
+                               stride=stride, padding=padding, dilation=dilation)
+        self.chomp2 = lambda x: Chomp1d(x, padding)   # 关键
+        self.bn2   = nn.BatchNorm1d(n_outputs)
+        self.relu2 = nn.ReLU()
+        self.drop2 = nn.Dropout(dropout)
+
+        self.downsample = nn.Conv1d(n_inputs, n_outputs, 1) \
+                          if n_inputs != n_outputs else None
+        self.relu = nn.ReLU()
+
+    def forward(self, x):
+        out = self.conv1(x)
+        out = self.chomp1(out)   # ↓↓↓ 裁剪后长度=L_in
+        out = self.bn1(out)
+        out = self.relu1(out)
+        out = self.drop1(out)
+
+        out = self.conv2(out)
+        out = self.chomp2(out)   # ↓↓↓ 再裁剪一次
+        out = self.bn2(out)
+        out = self.relu2(out)
+        out = self.drop2(out)
+
+        res = x if self.downsample is None else self.downsample(x)
+        return self.relu(out + res)
+
+
+class DecoderTCN(nn.Module):
+    def __init__(self, CNN_embed_dim=256, num_levels=3, h_FC_dim=128, drop_p=0.3, num_classes=5):
+        super().__init__()
+
+        # TCN需要输入格式为 [batch, channels, seq_len]
+        channels = [CNN_embed_dim] * num_levels  # 每层通道数
+        kernel_size = 3  # 卷积核大小
+
+        # 构建TCN块
+        layers = []
+        for i in range(num_levels):
+            dilation = 2 ** i  # 指数级扩张感受野
+            in_ch = CNN_embed_dim if i == 0 else channels[i - 1]
+            layers.append(TemporalBlock(
+                in_ch, channels[i], kernel_size,
+                stride=1,
+                dilation=dilation,
+                padding=(kernel_size - 1) * dilation,  # 因果卷积需要的padding
+                dropout=drop_p
+            ))
+        self.tcn = nn.Sequential(*layers)
+
+        # 输出层
+        self.fc1 = nn.Linear(channels[-1], h_FC_dim)
+        self.fc2 = nn.Linear(h_FC_dim, 1)
+        self.drop_p = drop_p
+
+    def forward(self, x):
+        # x: [batch, seq, features] -> [batch, features, seq]
+        x = x.transpose(1, 2)
+
+        # TCN处理
+        x = self.tcn(x)
+
+        # 取最后时间步的输出 [batch, channels, seq] -> [batch, channels]
+        x = x[:, :, -1]
+
+        # 全连接输出层
+        x = self.fc1(x)
+        x = F.relu(x)
+        x = F.dropout(x, p=self.drop_p, training=self.training)
+        x = self.fc2(x)
+        return x
+
+
+class Model(nn.Module):
+    def __init__(self, EncoderCNN, Decoder):
+        super().__init__()
+        self.EncoderCNN = EncoderCNN
+        self.Decoder = Decoder
+
+    def forward(self, x):
+        # LSTM: Ensure the input is on the CPU for compatibility with MPS
+        return self.Decoder(self.EncoderCNN(x).to('cpu')).to('mps')
+        # GRU: all on mps
+        # transformer: all on mps
+        # return self.Decoder(self.EncoderCNN(x))

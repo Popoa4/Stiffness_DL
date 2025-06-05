@@ -67,7 +67,7 @@ test_sigma = scaler_test.scale_.astype(np.float32)
 
 selected_frames = np.arange(begin_frame, end_frame, skip_frame).tolist()
 
-train_set, valid_set = Dataset_CRNN(data_path, train_list, train_label_scaled, train_label, selected_frames, transform=transform),                        Dataset_CRNN(data_path, test_list, test_label_scaled, test_label, selected_frames, transform=transform)
+train_set, valid_set = Dataset_CRNN(data_path, train_list, train_label_scaled, train_label, selected_frames, transform=transform), Dataset_CRNN(data_path, test_list, test_label_scaled, test_label, selected_frames, transform=transform)
 
 train_loader = data.DataLoader(train_set, **params)
 valid_loader = data.DataLoader(valid_set, **params)

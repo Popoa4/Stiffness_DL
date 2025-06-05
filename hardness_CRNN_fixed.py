@@ -8,9 +8,10 @@ import torch
 import torch.nn as nn
 import torchvision.transforms as transforms
 import torch.utils.data as data
+import math
 from torch.utils.data import DataLoader
 import matplotlib.pyplot as plt
-from functions import Model, EncoderCNN, DecoderRNN, Dataset_CRNN
+from functions import Model, EncoderCNN, DecoderRNN, DecoderGRU, DecoderTransformer, DecoderTCN, Dataset_CRNN
 from sklearn.model_selection import train_test_split
 from sklearn.preprocessing import StandardScaler
 
@@ -41,7 +42,7 @@ RNN_FC_dim = 128
 k = 5
 epochs = 30
 batch_size = 16
-learning_rate = 1e-5
+learning_rate = 1e-4
 log_interval = 10
 
 # Device
@@ -94,8 +95,29 @@ valid_loader = data.DataLoader(valid_set, **params)
 
 cnn_encoder = EncoderCNN(img_x=img_x, img_y=img_y, fc_hidden1=CNN_fc_hidden1, fc_hidden2=CNN_fc_hidden2,
                          drop_p=dropout_p, CNN_embed_dim=CNN_embed_dim).to(device, dtype=torch.float32)
+# selection1: LSTM
 rnn_decoder = DecoderRNN(CNN_embed_dim=CNN_embed_dim, h_RNN_layers=RNN_hidden_layers,
                          h_RNN=RNN_hidden_nodes, h_FC_dim=RNN_FC_dim, drop_p=dropout_p, num_classes=k).to('cpu')
+# selection2: GRU
+# rnn_decoder = DecoderGRU(CNN_embed_dim=CNN_embed_dim,
+#                         h_RNN_layers=RNN_hidden_layers,
+#                         h_RNN=RNN_hidden_nodes,
+#                         h_FC_dim=RNN_FC_dim,
+#                         drop_p=dropout_p,
+#                         num_classes=k).to(device, dtype=torch.float32)
+# selection3: Transformer
+# rnn_decoder = DecoderTransformer(CNN_embed_dim=CNN_embed_dim,
+#                                nhead=4,  # 可调整
+#                                num_layers=2,  # 可调整
+#                                h_FC_dim=RNN_FC_dim,
+#                                drop_p=dropout_p,
+#                                num_classes=k).to(device, dtype=torch.float32)
+# selection4: TCN
+# rnn_decoder = DecoderTCN(CNN_embed_dim=CNN_embed_dim,
+#                         num_levels=3,  # 可调整，影响感受野大小
+#                         h_FC_dim=RNN_FC_dim,
+#                         drop_p=dropout_p,
+#                         num_classes=k).to(device, dtype=torch.float32)
 model = Model(cnn_encoder, rnn_decoder)
 optimizer = torch.optim.AdamW(model.parameters(), lr=learning_rate)
 
