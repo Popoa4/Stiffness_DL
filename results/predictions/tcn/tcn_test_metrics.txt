@@ -1,0 +1,7 @@
+Test Results for model: tcn
+Checkpoint: ./checkpoints/tcn/tcn_epoch_50.pth
+RMSE (unscaled): 2.5939
+MAE (unscaled): 1.1241
+R2 Score: 0.9577
+Mean Relative Error (MRE): 4.25%
+Number of test samples: 251

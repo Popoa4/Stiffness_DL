@@ -1,0 +1,7 @@
+Test Results for model: transformer
+Checkpoint: ./checkpoints/transformer/transformer_epoch_50.pth
+RMSE (unscaled): 2.8619
+MAE (unscaled): 1.2262
+R2 Score: 0.9485
+Mean Relative Error (MRE): 4.60%
+Number of test samples: 251

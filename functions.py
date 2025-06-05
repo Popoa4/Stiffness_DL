@@ -152,7 +152,7 @@ class EncoderCNN(nn.Module):
         return cnn_embed_seq
 
 class DecoderRNN(nn.Module):
-    def __init__(self, CNN_embed_dim=256, h_RNN_layers=1, h_RNN=256, h_FC_dim=128, drop_p=0.3, num_classes=5):
+    def __init__(self, CNN_embed_dim=256, h_RNN_layers=1, h_RNN=256, h_FC_dim=128, drop_p=0.3):
         super(DecoderRNN, self).__init__()
         self.LSTM = nn.LSTM(input_size=CNN_embed_dim, hidden_size=h_RNN, num_layers=h_RNN_layers, batch_first=True)
         self.fc1 = nn.Linear(h_RNN, h_FC_dim)
@@ -169,7 +169,7 @@ class DecoderRNN(nn.Module):
 
 ## -------------------- DecoderGRU module ---------------------- ##
 class DecoderGRU(nn.Module):
-    def __init__(self, CNN_embed_dim=256, h_RNN_layers=1, h_RNN=256, h_FC_dim=128, drop_p=0.3, num_classes=5):
+    def __init__(self, CNN_embed_dim=256, h_RNN_layers=1, h_RNN=256, h_FC_dim=128, drop_p=0.3):
         super(DecoderGRU, self).__init__()
         self.GRU = nn.GRU(input_size=CNN_embed_dim,
                           hidden_size=h_RNN,
@@ -207,7 +207,7 @@ class PositionalEncoding(nn.Module):
 
 
 class DecoderTransformer(nn.Module):
-    def __init__(self, CNN_embed_dim=256, nhead=4, num_layers=2, h_FC_dim=128, drop_p=0.3, num_classes=5):
+    def __init__(self, CNN_embed_dim=256, nhead=4, num_layers=2, h_FC_dim=128, drop_p=0.3):
         super().__init__()
         # 位置编码
         self.pos_encoder = PositionalEncoding(CNN_embed_dim)
@@ -288,7 +288,7 @@ class TemporalBlock(nn.Module):
 
 
 class DecoderTCN(nn.Module):
-    def __init__(self, CNN_embed_dim=256, num_levels=3, h_FC_dim=128, drop_p=0.3, num_classes=5):
+    def __init__(self, CNN_embed_dim=256, num_levels=3, h_FC_dim=128, drop_p=0.3):
         super().__init__()
 
         # TCN需要输入格式为 [batch, channels, seq_len]
@@ -332,15 +332,34 @@ class DecoderTCN(nn.Module):
         return x
 
 
+# class Model(nn.Module):
+#     def __init__(self, EncoderCNN, Decoder):
+#         super().__init__()
+#         self.EncoderCNN = EncoderCNN
+#         self.Decoder = Decoder
+#
+#     def forward(self, x):
+#         # LSTM: Ensure the input is on the CPU for compatibility with MPS
+#         # return self.Decoder(self.EncoderCNN(x).to('cpu')).to('mps')
+#         # GRU: all on mps
+#         # transformer: all on mps
+#         return self.Decoder(self.EncoderCNN(x))
+# 其余内容完全不变，只贴出 Model
+
 class Model(nn.Module):
-    def __init__(self, EncoderCNN, Decoder):
+    """
+    Encoder 在主设备 (cuda/mps/cpu)；
+    LSTM-decoder 固定在 CPU；其余 decoder 跟随主设备。
+    """
+    def __init__(self, encoder, decoder, model_type: str):
         super().__init__()
-        self.EncoderCNN = EncoderCNN
-        self.Decoder = Decoder
+        self.encoder = encoder
+        self.decoder = decoder
+        self.model_type = model_type.lower()
 
     def forward(self, x):
-        # LSTM: Ensure the input is on the CPU for compatibility with MPS
-        # return self.Decoder(self.EncoderCNN(x).to('cpu')).to('mps')
-        # GRU: all on mps
-        # transformer: all on mps
-        return self.Decoder(self.EncoderCNN(x))
+        feats = self.encoder(x)                              # on main device
+        dec_device = next(self.decoder.parameters()).device  # cpu for LSTM，其余同 encoder
+        feats = feats.to(dec_device)
+        out   = self.decoder(feats)
+        return out

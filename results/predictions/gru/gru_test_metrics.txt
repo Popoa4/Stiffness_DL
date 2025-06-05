@@ -1,0 +1,7 @@
+Test Results for model: gru
+Checkpoint: ./checkpoints/gru/gru_epoch_50.pth
+RMSE (unscaled): 2.7236
+MAE (unscaled): 0.9845
+R2 Score: 0.9533
+Mean Relative Error (MRE): 3.98%
+Number of test samples: 251
