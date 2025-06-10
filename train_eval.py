@@ -168,17 +168,18 @@ def get_model(model_type: str, device):
     elif model_type == 'transformer':
         decoder = DecoderTransformer(
             CNN_embed_dim=256,
-            nhead=4,
+            nhead=8,
             num_layers=2,
             h_FC_dim=128,
-            drop_p=0.1
+            drop_p=0.2
         ).to(device)
     elif model_type == 'tcn':
         decoder = DecoderTCN(
             CNN_embed_dim=256,
             num_levels=3,
             h_FC_dim=128,
-            drop_p=0.1
+            kernel_size=5,
+            drop_p=0.3
         ).to(device)
     else:
         raise ValueError(f"Unsupported model type: {model_type}")
@@ -209,6 +210,9 @@ def train_epoch(model, device, train_loader, optimizer, criterion, epoch, scaler
         loss = criterion(output, y_scale_target)
         rmse_loss = torch.sqrt(loss)  # Original code uses sqrt of MSE
         rmse_loss.backward()
+        # Gradient clipping to prevent exploding gradients
+        torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+
         optimizer.step()
 
         total_loss += rmse_loss.item() * X.size(0)

@@ -288,12 +288,12 @@ class TemporalBlock(nn.Module):
 
 
 class DecoderTCN(nn.Module):
-    def __init__(self, CNN_embed_dim=256, num_levels=3, h_FC_dim=128, drop_p=0.3):
+    def __init__(self, CNN_embed_dim=256, num_levels=3, h_FC_dim=128, drop_p=0.3, kernel_size = 3):
         super().__init__()
 
         # TCN需要输入格式为 [batch, channels, seq_len]
         channels = [CNN_embed_dim] * num_levels  # 每层通道数
-        kernel_size = 3  # 卷积核大小
+        # kernel_size = 3  # 卷积核大小
 
         # 构建TCN块
         layers = []

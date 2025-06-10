@@ -1,7 +1,7 @@
 Test Results for model: lstm
 Checkpoint: ./checkpoints/lstm/lstm_epoch_50.pth
-RMSE (unscaled): 2.2981
-MAE (unscaled): 0.7187
-R2 Score: 0.9668
-Mean Relative Error (MRE): 2.71%
+RMSE (unscaled): 1.9579
+MAE (unscaled): 0.6603
+R2 Score: 0.9759
+Mean Relative Error (MRE): 2.27%
 Number of test samples: 251
