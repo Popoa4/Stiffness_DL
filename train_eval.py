@@ -21,12 +21,22 @@ from functions import (
 
 # --- Configuration ---
 # Default values, can be overridden by args or modified here
-DEF_DATA_PATH = "/Users/ethanshao/Desktop/ucl/research project/Stiffness_DL/Dataset/hardness_5_2024_03_03"  # Update if needed
+DEF_DATA_PATH_1 = "/Users/ethanshao/Desktop/ucl/research project/Stiffness_DL/Dataset/hardness_5_2024_03_03"
+DEF_DATA_PATH_2 = "/Users/ethanshao/Desktop/ucl/research project/Stiffness_DL/Dataset/hardness-1Data"  # Second dataset path
+
+DATASET_OPTIONS = {
+    "dataset1": {
+        "path": DEF_DATA_PATH_1,
+        "name": "hardness5"
+    },
+    "dataset2": {
+        "path": DEF_DATA_PATH_2,
+        "name": "hardness1Data"
+    }
+}
+
 DEF_CHECKPOINT_DIR = "./checkpoints"
 DEF_RESULTS_DIR = "./results"
-DEF_LOGS_DIR = os.path.join(DEF_RESULTS_DIR, "logs")
-DEF_PLOTS_DIR = os.path.join(DEF_RESULTS_DIR, "plots")
-DEF_PREDICTIONS_DIR = os.path.join(DEF_RESULTS_DIR, "predictions")
 
 # Architecture Params (from original hardness_CRNN_fixed.py)
 CNN_FC_HIDDEN1, CNN_FC_HIDDEN2 = 512, 348
@@ -42,10 +52,9 @@ TRANSFORMER_NHEAD = 4
 TRANSFORMER_NUMLAYERS = 2
 TCN_NUM_LEVELS = 3
 TCN_KERNEL_SIZE = 3
-# TCN_CHANNELS = [CNN_EMBED_DIM // 2] * TCN_NUM_LEVELS # Example: [128, 128, 128] if CNN_EMBED_DIM is 256
 
 # Training Params
-EPOCHS = 50
+EPOCHS = 30
 BATCH_SIZE = 16
 LEARNING_RATE = 1e-4
 LOG_INTERVAL = 10  # Print training log every N batches
@@ -58,39 +67,91 @@ def setup_device():
         device = torch.device("cuda")
     elif torch.backends.mps.is_available():
         device = torch.device("mps")
-        # MPS specific settings from original code (optional, test if needed)
-        # os.environ['PYTORCH_ENABLE_MPS_F16_CONV'] = '0'
-        # os.environ['PYTORCH_MPS_HIGH_WATERMARK_RATIO'] = '0.0'
-        # torch.backends.mps.deterministic = True # May impact performance
     else:
         device = torch.device("cpu")
     print(f"**Display: Using device: {device}**")
     return device
 
 
-def create_dirs(model_name):
-    os.makedirs(os.path.join(DEF_CHECKPOINT_DIR, model_name), exist_ok=True)
-    os.makedirs(os.path.join(DEF_LOGS_DIR, model_name), exist_ok=True)
-    os.makedirs(os.path.join(DEF_PLOTS_DIR, model_name), exist_ok=True)
-    os.makedirs(os.path.join(DEF_PREDICTIONS_DIR, model_name), exist_ok=True)
-    print(f"**Display: Created directories for model '{model_name}' under {DEF_CHECKPOINT_DIR} and {DEF_RESULTS_DIR}**")
+def create_dirs(model_name, dataset_name):
+    """Create directories for saving model checkpoints and results, specific to dataset and model"""
+    # Combine model_name and dataset_name for unique directory structure
+    model_dataset_name = f"{model_name}_{dataset_name}"
+
+    # Create all necessary directories
+    checkpoint_dir = os.path.join(DEF_CHECKPOINT_DIR, model_dataset_name)
+    logs_dir = os.path.join(DEF_RESULTS_DIR, "logs", model_dataset_name)
+    plots_dir = os.path.join(DEF_RESULTS_DIR, "plots", model_dataset_name)
+    predictions_dir = os.path.join(DEF_RESULTS_DIR, "predictions", model_dataset_name)
+
+    os.makedirs(checkpoint_dir, exist_ok=True)
+    os.makedirs(logs_dir, exist_ok=True)
+    os.makedirs(plots_dir, exist_ok=True)
+    os.makedirs(predictions_dir, exist_ok=True)
+
+    print(f"**Display: Created directories for model '{model_name}' with dataset '{dataset_name}'**")
+
+    return {
+        "checkpoint_dir": checkpoint_dir,
+        "logs_dir": logs_dir,
+        "plots_dir": plots_dir,
+        "predictions_dir": predictions_dir
+    }
 
 
-def get_data_loaders(data_path, batch_size, random_state, img_x, img_y):
-    print("**Display: Loading and splitting data...**")
+# def get_data_loaders(data_path, batch_size, random_state, img_x, img_y):
+#     print(f"**Display: Loading and splitting data from: {data_path}**")
+#     all_Y_list_raw = []
+#     all_X_list_fnames = []
+#     # Filter out system files like .DS_Store and ensure correct sorting if needed
+#     fnames = sorted(
+#         [f for f in os.listdir(data_path) if not f.startswith('.') and os.path.isdir(os.path.join(data_path, f))])
+#
+#     for f_dir in fnames:
+#         try:
+#             label = int(f_dir[7:9])  # Assuming folder name format like 'hard_xx_...'
+#             all_Y_list_raw.append(label)
+#             all_X_list_fnames.append(f_dir)
+#         except ValueError:
+#             print(f"Warning: Could not parse label from folder name '{f_dir}'. Skipping.")
+#             continue
+#
+#
+#     if not all_X_list_fnames:
+#         raise ValueError(f"No valid data folders found in {data_path}. Check path and folder naming.")
+def get_data_loaders(data_path, batch_size, random_state, img_x, img_y, dataset_type):
+    print(f"**Display: Loading and splitting data from: {data_path}**")
     all_Y_list_raw = []
     all_X_list_fnames = []
-    # Filter out system files like .DS_Store and ensure correct sorting if needed
+
+        # Filter out system files like .DS_Store and ensure correct sorting
     fnames = sorted(
         [f for f in os.listdir(data_path) if not f.startswith('.') and os.path.isdir(os.path.join(data_path, f))])
 
+    # Set label position based on dataset type
+    if dataset_type == 'dataset1':  # hardness5
+        label_start_idx = 7  # 'hard_XX_...'
+    elif dataset_type == 'dataset2':  # hardness10
+        label_start_idx = 8  # different format with label at position 8-9
+    else:
+        raise ValueError(f"Unknown dataset type: {dataset_type}")
+
+    label_end_idx = label_start_idx + 2  # Extract 2 digits
+
     for f_dir in fnames:
         try:
-            label = int(f_dir[7:9])  # Assuming folder name format like 'hard_xx_...'
-            all_Y_list_raw.append(label)
-            all_X_list_fnames.append(f_dir)
+            # Extract label based on dataset-specific position
+            if len(f_dir) > label_end_idx:
+                label_str = f_dir[label_start_idx:label_end_idx]
+                label = int(label_str)
+                all_Y_list_raw.append(label)
+                all_X_list_fnames.append(f_dir)
+            else:
+                print(f"Warning: Folder name '{f_dir}' too short for label extraction. Skipping.")
+                continue
         except ValueError:
-            print(f"Warning: Could not parse label from folder name '{f_dir}'. Skipping.")
+            print(
+                f"Warning: Could not parse label from folder name '{f_dir}' at position {label_start_idx}:{label_end_idx}. Skipping.")
             continue
 
     if not all_X_list_fnames:
@@ -187,7 +248,6 @@ def get_model(model_type: str, device):
     return Model(cnn_encoder, decoder, model_type)
 
 
-
 def train_epoch(model, device, train_loader, optimizer, criterion, epoch, scaler, log_interval):
     model.train()
     total_loss = 0.0
@@ -201,8 +261,7 @@ def train_epoch(model, device, train_loader, optimizer, criterion, epoch, scaler
     pbar = tqdm(enumerate(train_loader), total=len(train_loader), desc=f"Epoch {epoch + 1}/{EPOCHS} [Train]")
     for batch_idx, (X, y_scale, y_orig) in pbar:
         X = X.to(device, dtype=torch.float32)  # Input to CNN encoder
-        y_scale_target = y_scale.to(decoder_param_device,
-                                    dtype=torch.float32)  # Target for loss, on decoder's output device
+        y_scale_target = y_scale.to(decoder_param_device, dtype=torch.float32)  # Target on decoder's device
 
         optimizer.zero_grad()
         output = model(X)  # Output will be on decoder_param_device
@@ -210,6 +269,7 @@ def train_epoch(model, device, train_loader, optimizer, criterion, epoch, scaler
         loss = criterion(output, y_scale_target)
         rmse_loss = torch.sqrt(loss)  # Original code uses sqrt of MSE
         rmse_loss.backward()
+
         # Gradient clipping to prevent exploding gradients
         torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
 
@@ -233,7 +293,7 @@ def train_epoch(model, device, train_loader, optimizer, criterion, epoch, scaler
     return avg_epoch_loss, avg_epoch_mae_unscaled
 
 
-def validate_epoch(model, device, val_loader, criterion, scaler, epoch=None):  # Epoch for logging if needed
+def validate_epoch(model, device, val_loader, criterion, scaler, epoch=None):
     model.eval()
     total_loss = 0.0
     total_abs_err_unscaled = 0.0
@@ -271,27 +331,17 @@ def validate_epoch(model, device, val_loader, criterion, scaler, epoch=None):  #
     return avg_epoch_loss, avg_epoch_mae_unscaled
 
 
-def test_model_and_save_results(model, device, test_loader, scaler, model_name, checkpoint_path=None):
+def test_model_and_save_results(model, device, test_loader, scaler, model_name, dataset_name, dirs,
+                                checkpoint_path=None):
     if checkpoint_path:
         print(f"**Display: Loading model from {checkpoint_path} for testing.**")
-        # Determine map_location: if LSTM, decoder weights are CPU. Encoder is on device.
-        # A bit tricky if model was saved as state_dict of the Model class which has submodules
-        # For simplicity, load the full state_dict and trust PyTorch to map correctly if model is already on devices
-        # Or, if loading to a fresh model instance:
-        # fresh_model = get_model(model_name, device) # re-initializes on correct devices
-        # fresh_model.load_state_dict(torch.load(checkpoint_path, map_location=lambda storage, loc: storage)) # generic load
-        # model = fresh_model
         try:
-            model.load_state_dict(
-                torch.load(checkpoint_path, map_location=device, weights_only=True))  # Try loading directly to main device
+            model.load_state_dict(torch.load(checkpoint_path, map_location=device))
         except RuntimeError as e:
             print(f"Standard load failed ({e}), attempting careful load for mixed devices (e.g. LSTM)...")
-            # If LSTM model, parts are on CPU. Need to load carefully or ensure model is constructed first.
-            # Easiest is to construct the model correctly first, then load state_dict.
-            # The `model` passed in should already be constructed.
-            state_dict = torch.load(checkpoint_path, map_location=torch.device('cpu'))  # Load all to CPU first
-            model.load_state_dict(state_dict)  # Then load into correctly pre-configured model
-            # Ensure modules are on their designated devices after loading (esp. if not done by get_model)
+            state_dict = torch.load(checkpoint_path, map_location=torch.device('cpu'))
+            model.load_state_dict(state_dict)
+            # Ensure modules are on their designated devices after loading
             model.EncoderCNN.to(device)
             if model.model_type == 'lstm':
                 model.decoder.to(torch.device('cpu'))
@@ -312,8 +362,6 @@ def test_model_and_save_results(model, device, test_loader, scaler, model_name, 
     with torch.no_grad():
         for X, y_scale, y_orig in pbar:
             X = X.to(device, dtype=torch.float32)
-            # y_scale_target = y_scale.to(decoder_param_device, dtype=torch.float32) # Not needed for loss here
-
             output_scaled = model(X)  # Scaled output from model
 
             pred_unscaled = scaler.inverse_transform(output_scaled.detach().cpu().numpy())
@@ -321,7 +369,7 @@ def test_model_and_save_results(model, device, test_loader, scaler, model_name, 
             all_predictions_unscaled.extend(pred_unscaled.flatten().tolist())
             all_true_values_unscaled.extend(y_orig.numpy().flatten().tolist())
             all_scaled_predictions.extend(output_scaled.detach().cpu().numpy().flatten().tolist())
-            all_scaled_true.extend(y_scale.numpy().flatten().tolist())  # y_scale is already on CPU from dataloader
+            all_scaled_true.extend(y_scale.numpy().flatten().tolist())
 
     # Calculate metrics
     true_np = np.array(all_true_values_unscaled)
@@ -331,11 +379,11 @@ def test_model_and_save_results(model, device, test_loader, scaler, model_name, 
     rmse = np.sqrt(mse)
     mae = mean_absolute_error(true_np, pred_np)
     r2 = r2_score(true_np, pred_np)
-    # Relative error (MAPE-like, but mean of |(pred-true)/true|)
-    # Avoid division by zero if true_np can be zero
+
+    # Relative error calculation
     non_zero_mask = true_np != 0
     if np.sum(non_zero_mask) == 0:
-        mre = float('inf')  # Or handle as NaN or specific message
+        mre = float('inf')
     else:
         mre = np.mean(np.abs((pred_np[non_zero_mask] - true_np[non_zero_mask]) / true_np[non_zero_mask]))
 
@@ -346,10 +394,8 @@ def test_model_and_save_results(model, device, test_loader, scaler, model_name, 
     print(f"  **Mean Relative Error (MRE): {mre * 100:.2f}%**")
 
     # Save results
-    results_path_base = os.path.join(DEF_PREDICTIONS_DIR, model_name)
-
     metrics_summary = (
-        f"Test Results for model: {model_name}\n"
+        f"Test Results for model: {model_name}, dataset: {dataset_name}\n"
         f"Checkpoint: {checkpoint_path or 'N/A (trained in same run)'}\n"
         f"RMSE (unscaled): {rmse:.4f}\n"
         f"MAE (unscaled): {mae:.4f}\n"
@@ -358,34 +404,34 @@ def test_model_and_save_results(model, device, test_loader, scaler, model_name, 
         f"Number of test samples: {len(true_np)}\n"
     )
 
-    with open(os.path.join(results_path_base, f"{model_name}_test_metrics.txt"), "w") as f:
+    metrics_path = os.path.join(dirs["predictions_dir"], f"{model_name}_{dataset_name}_test_metrics.txt")
+    with open(metrics_path, "w") as f:
         f.write(metrics_summary)
-    print(f"**Display: Test metrics saved to {os.path.join(results_path_base, f'{model_name}_test_metrics.txt')}**")
+    print(f"**Display: Test metrics saved to {metrics_path}**")
 
     # Save predictions
-    # It might be useful to also save the filenames if you need to map predictions back
-    # For now, just true vs pred
     df_predictions = pd.DataFrame({
         'true_value_unscaled': all_true_values_unscaled,
         'predicted_value_unscaled': all_predictions_unscaled,
         'true_value_scaled': all_scaled_true,
         'predicted_value_scaled': all_scaled_predictions
     })
-    df_predictions.to_csv(os.path.join(results_path_base, f"{model_name}_test_predictions.csv"), index=False)
-    print(
-        f"**Display: Test predictions saved to {os.path.join(results_path_base, f'{model_name}_test_predictions.csv')}**")
+
+    predictions_path = os.path.join(dirs["predictions_dir"], f"{model_name}_{dataset_name}_test_predictions.csv")
+    df_predictions.to_csv(predictions_path, index=False)
+    print(f"**Display: Test predictions saved to {predictions_path}**")
 
     return rmse, mae, r2, mre
 
 
-def plot_metrics(epochs_ran, train_losses, val_losses, train_errors, val_errors, model_name):
+def plot_metrics(epochs_ran, train_losses, val_losses, train_errors, val_errors, model_name, dataset_name, dirs):
     epochs_axis = np.arange(1, epochs_ran + 1)
     plt.figure(figsize=(12, 5))
 
     plt.subplot(1, 2, 1)
     plt.plot(epochs_axis, train_losses, label='Train RMSE Loss')
     plt.plot(epochs_axis, val_losses, label='Validation RMSE Loss')
-    plt.title(f'{model_name.upper()} - Model RMSE Loss')
+    plt.title(f'{model_name.upper()} - {dataset_name} - Model RMSE Loss')
     plt.xlabel('Epochs')
     plt.ylabel('RMSE Loss')
     plt.legend()
@@ -394,30 +440,40 @@ def plot_metrics(epochs_ran, train_losses, val_losses, train_errors, val_errors,
     plt.subplot(1, 2, 2)
     plt.plot(epochs_axis, train_errors, label='Train MAE (unscaled)')
     plt.plot(epochs_axis, val_errors, label='Validation MAE (unscaled)')
-    plt.title(f'{model_name.upper()} - Model MAE (unscaled)')
+    plt.title(f'{model_name.upper()} - {dataset_name} - Model MAE (unscaled)')
     plt.xlabel('Epochs')
     plt.ylabel('Mean Absolute Error')
     plt.legend()
     plt.grid(True)
 
     plt.tight_layout()
-    plot_filename = os.path.join(DEF_PLOTS_DIR, model_name, f"{model_name}_training_curves.png")
+    plot_filename = os.path.join(dirs["plots_dir"], f"{model_name}_{dataset_name}_training_curves.png")
     plt.savefig(plot_filename, dpi=300)
     print(f"**Display: Training curves plot saved to {plot_filename}**")
-    # plt.show() # Optional: display plot
 
 
 def main(args):
+    # Get dataset information based on selection
+    dataset_info = DATASET_OPTIONS.get(args.dataset_type)
+    if not dataset_info:
+        raise ValueError(
+            f"Invalid dataset type: {args.dataset_type}. Valid options are: {', '.join(DATASET_OPTIONS.keys())}")
+
+    data_path = dataset_info["path"]
+    dataset_name = dataset_info["name"]
+
+    print(f"**Display: Using dataset: {dataset_name} from {data_path}**")
+
     # Setup
     device = setup_device()
-    create_dirs(args.model_type)  # Create directories specific to the model type
+
+    # Create dataset and model specific directories
+    dirs = create_dirs(args.model_type, dataset_name)
 
     # Data
     train_loader, val_loader, test_loader, scaler = get_data_loaders(
-        args.data_path, args.batch_size, RANDOM_STATE, IMG_X, IMG_Y
+        data_path, args.batch_size, RANDOM_STATE, IMG_X, IMG_Y, args.dataset_type
     )
-    scale_mean_sigma = {'mean': scaler.mean_.astype(np.float32),
-                        'sigma': scaler.scale_.astype(np.float32)}
 
     # Model
     model = get_model(args.model_type, device)
@@ -430,7 +486,8 @@ def main(args):
     epoch_train_losses, epoch_val_losses = [], []
     epoch_train_errors, epoch_val_errors = [], []  # Using MAE (unscaled) for error tracking
 
-    print(f"\n**Display: Starting training for {args.model_type.upper()} model for {args.epochs} epochs...**")
+    print(
+        f"\n**Display: Starting training for {args.model_type.upper()} model on {dataset_name} for {args.epochs} epochs...**")
     for epoch in range(args.epochs):
         train_loss, train_error = train_epoch(
             model, device, train_loader, optimizer, criterion, epoch, scaler, args.log_interval
@@ -444,18 +501,14 @@ def main(args):
         epoch_train_errors.append(train_error)
         epoch_val_errors.append(val_error)
 
-        # Save model checkpoint every 5 epochs or at the end
+        # Save model checkpoint every 10 epochs or at the end
         if (epoch + 1) % 10 == 0 or (epoch + 1) == args.epochs:
             print(f"**Display: Saving checkpoint for epoch {epoch + 1}...**")
-            if not os.path.exists(os.path.join(DEF_CHECKPOINT_DIR, args.model_type)):
-                os.makedirs(os.path.join(DEF_CHECKPOINT_DIR, args.model_type))
-            # Save model state_dict
-            checkpoint_name = f"{args.model_type}_epoch_{epoch + 1}.pth"
-            checkpoint_save_path = os.path.join(DEF_CHECKPOINT_DIR, args.model_type, checkpoint_name)
+            checkpoint_name = f"{args.model_type}_{dataset_name}_epoch_{epoch + 1}.pth"
+            checkpoint_save_path = os.path.join(dirs["checkpoint_dir"], checkpoint_name)
             torch.save(model.state_dict(), checkpoint_save_path)
-        # print(f"Checkpoint saved: {checkpoint_save_path}") # Logged by tqdm mostly
 
-        # Save logs periodically or at the end
+        # Save logs after each epoch
         log_data = {
             'train_rmse_loss': epoch_train_losses,
             'val_rmse_loss': epoch_val_losses,
@@ -463,29 +516,30 @@ def main(args):
             'val_mae_unscaled': epoch_val_errors
         }
         df_logs = pd.DataFrame(log_data)
-        df_logs.to_csv(os.path.join(DEF_LOGS_DIR, args.model_type, f"{args.model_type}_training_log.csv"),
-                       index_label="epoch")
+        log_path = os.path.join(dirs["logs_dir"], f"{args.model_type}_{dataset_name}_training_log.csv")
+        df_logs.to_csv(log_path, index_label="epoch")
 
     print("**Display: Training finished.**")
 
     # Plot training curves
     plot_metrics(args.epochs, epoch_train_losses, epoch_val_losses,
-                 epoch_train_errors, epoch_val_errors, args.model_type)
+                 epoch_train_errors, epoch_val_errors, args.model_type, dataset_name, dirs)
 
-    # Test the model (using the model from the last epoch as requested)
-    final_model_path = os.path.join(DEF_CHECKPOINT_DIR, args.model_type, f"{args.model_type}_epoch_{args.epochs}.pth")
-    print(f"\n**Display: Proceeding to test the final model from epoch {args.epochs}...**")
-    test_model_and_save_results(model, device, test_loader, scaler, args.model_type, checkpoint_path=final_model_path)
+    # Test the model using the final checkpoint
+    final_model_path = os.path.join(dirs["checkpoint_dir"], f"{args.model_type}_{dataset_name}_epoch_{args.epochs}.pth")
+    print(f"\n**Display: Proceeding to test the final model from epoch {args.epochs} on {dataset_name}...**")
+    test_model_and_save_results(model, device, test_loader, scaler, args.model_type, dataset_name, dirs,
+                                checkpoint_path=final_model_path)
 
-    print(f"**Display: Process for model {args.model_type.upper()} completed.**")
+    print(f"**Display: Process for model {args.model_type.upper()} on dataset {dataset_name} completed.**")
 
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser(description="Train and Evaluate CRNN-variant models for hardness estimation.")
     parser.add_argument('--model_type', type=str, required=True, choices=['lstm', 'gru', 'transformer', 'tcn'],
                         help="Type of decoder model to use (lstm, gru, transformer, tcn).")
-    parser.add_argument('--data_path', type=str, default=DEF_DATA_PATH,
-                        help=f"Path to the dataset directory (default: {DEF_DATA_PATH}).")
+    parser.add_argument('--dataset_type', type=str, required=True, choices=['dataset1', 'dataset2'],
+                        help="Which dataset to use (dataset1: hardness5, dataset2: hardness10)")
     parser.add_argument('--epochs', type=int, default=EPOCHS,
                         help=f"Number of training epochs (default: {EPOCHS}).")
     parser.add_argument('--batch_size', type=int, default=BATCH_SIZE,
@@ -495,11 +549,9 @@ if __name__ == '__main__':
     parser.add_argument('--log_interval', type=int, default=LOG_INTERVAL,
                         help=f"Log training progress every N batches (default: {LOG_INTERVAL}).")
 
-    # You can add more arguments for other hyperparameters if needed (e.g., CNN_EMBED_DIM, RNN_HIDDEN_NODES etc.)
-
     parsed_args = parser.parse_args()
 
-    # Ensure EPOCHS is set to the argument value for consistency if it's used globally
+    # Ensure globals are updated
     EPOCHS = parsed_args.epochs
     BATCH_SIZE = parsed_args.batch_size
     LEARNING_RATE = parsed_args.learning_rate

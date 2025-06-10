@@ -44,7 +44,13 @@ class Dataset_CRNN(data.Dataset):
         begin_frame = 0
         end_frame = frame_count - 1
         total_frames = 10
+        if frame_count < total_frames:
+            begin_frame = 0
+            end_frame = frame_count - 1
+            total_frames = frame_count
         skip_frame = frame_count // total_frames
+        # print("Reading folder: {}, total frames: {}, skip frame: {}".format(
+        #     selected_folder, frame_count, skip_frame))
         selected_frames = np.arange(begin_frame, end_frame + 1, skip_frame)
         if len(selected_frames) > total_frames:
             selected_frames = selected_frames[:total_frames]

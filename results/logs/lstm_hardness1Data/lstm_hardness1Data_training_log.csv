@@ -1,0 +1,2 @@
+epoch,train_rmse_loss,val_rmse_loss,train_mae_unscaled,val_mae_unscaled
+0,0.7428479303982968,0.6655512854079376,17.325777,14.87811
