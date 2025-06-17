@@ -1,20 +1,14 @@
 import os
+
+import matplotlib.pyplot as plt
 import numpy as np
 import torch
-import torch.nn as nn
-import torch.nn.functional as F
-import torchvision.models as models
-import torchvision.transforms as transforms
 import torch.utils.data as data
-from torch.utils.data import DataLoader, Dataset
-import torchvision
-from torch.autograd import Variable
-import matplotlib.pyplot as plt
-from functions import Model, EncoderCNN, DecoderRNN, Dataset_CRNN
+import torchvision.transforms as transforms
 from sklearn.model_selection import train_test_split
-from sklearn.preprocessing import OneHotEncoder, LabelEncoder, StandardScaler
-from sklearn.metrics import accuracy_score
-import pickle
+from sklearn.preprocessing import StandardScaler
+
+from functions import Model, EncoderCNN, DecoderRNN, Dataset_CRNN
 
 # set path
 data_path = "/Users/ethanshao/Desktop/ucl/research project/Stiffness_DL/Dataset/hardness_5_2024_03_03"

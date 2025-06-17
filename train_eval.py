@@ -12,11 +12,12 @@ from sklearn.preprocessing import StandardScaler
 from sklearn.metrics import mean_squared_error, mean_absolute_error, r2_score
 import matplotlib.pyplot as plt
 from tqdm import tqdm
+from timm import create_model
 
 # Import from functions.py
 from functions import (
     Dataset_CRNN, EncoderCNN, DecoderRNN, DecoderGRU,
-    DecoderTransformer, DecoderTCN, Model
+    DecoderTransformer, DecoderTCN, VideoTransformer, Model
 )
 
 # --- Configuration ---
@@ -54,7 +55,7 @@ TCN_NUM_LEVELS = 3
 TCN_KERNEL_SIZE = 3
 
 # Training Params
-EPOCHS = 30
+EPOCHS = 50
 BATCH_SIZE = 16
 LEARNING_RATE = 1e-4
 LOG_INTERVAL = 10  # Print training log every N batches
@@ -119,7 +120,7 @@ def create_dirs(model_name, dataset_name):
 #
 #     if not all_X_list_fnames:
 #         raise ValueError(f"No valid data folders found in {data_path}. Check path and folder naming.")
-def get_data_loaders(data_path, batch_size, random_state, img_x, img_y, dataset_type):
+def get_data_loaders(data_path, batch_size, random_state, img_x, img_y, dataset_type, n_frames=10):
     print(f"**Display: Loading and splitting data from: {data_path}**")
     all_Y_list_raw = []
     all_X_list_fnames = []
@@ -184,9 +185,9 @@ def get_data_loaders(data_path, batch_size, random_state, img_x, img_y, dataset_
         transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
     ])
 
-    train_dataset = Dataset_CRNN(data_path, X_train, Y_train_scaled, Y_train_raw, transform=transform)
-    val_dataset = Dataset_CRNN(data_path, X_val, Y_val_scaled, Y_val_raw, transform=transform)
-    test_dataset = Dataset_CRNN(data_path, X_test, Y_test_scaled, Y_test_raw, transform=transform)
+    train_dataset = Dataset_CRNN(data_path, X_train, Y_train_scaled, Y_train_raw, transform=transform, n_frames=n_frames)
+    val_dataset = Dataset_CRNN(data_path, X_val, Y_val_scaled, Y_val_raw, transform=transform, n_frames=n_frames)
+    test_dataset = Dataset_CRNN(data_path, X_test, Y_test_scaled, Y_test_raw, transform=transform, n_frames=n_frames)
 
     # Dataloader params from original code
     loader_params = {'batch_size': batch_size, 'num_workers': 0, 'pin_memory': False}  # pin_memory True if using CUDA
@@ -198,7 +199,26 @@ def get_data_loaders(data_path, batch_size, random_state, img_x, img_y, dataset_
     return train_loader, val_loader, test_loader, scaler
 
 
-def get_model(model_type: str, device):
+def get_model(model_type: str, n_frames, device):
+    if model_type == 'video_tf':
+        # print(f"**Display: Initializing VideoTransformer model with {n_frames} frames per sample.**")
+        model = VideoTransformer(
+            img_size=IMG_X,
+            patch_size=16,
+            n_frames=n_frames,
+            pretrained_model_name='vit_small_patch16_224',  # 小型ViT (22M参数)
+            # 也可以尝试: 'vit_base_patch16_224' (大型, 86M参数)
+            # 或 'vit_tiny_patch16_224' (更小, 仅6M参数)
+            drop_p=DROPOUT_P
+        ).to(device)
+        # 选择性冻结预训练部分
+        for name, param in model.named_parameters():
+            # 只训练时间Transformer、时间位置编码和回归头
+            if 'temporal' in name or 'time_embed' in name or 'head' in name:
+                param.requires_grad = True
+            else:
+                param.requires_grad = False
+        return model
     # --- Encoder (始终在主设备) ---
     cnn_encoder = EncoderCNN(
         img_x=224, img_y=224,
@@ -248,49 +268,97 @@ def get_model(model_type: str, device):
     return Model(cnn_encoder, decoder, model_type)
 
 
-def train_epoch(model, device, train_loader, optimizer, criterion, epoch, scaler, log_interval):
+def train_epoch(
+        model, device, train_loader,
+        optimizer, criterion,
+        epoch,                     # 当前 epoch 索引
+        global_step,               # 上一个 epoch 结束时的步数
+        main_scheduler,            # CosineAnnealingLR
+        warmup_steps,              # warm-up 总步数
+        base_lr,                   # 用户设定学习率
+        scaler,                    # label 的 StandardScaler
+        log_interval               # 打印频率
+    ):
+    """
+    返 回:
+        avg_epoch_loss, avg_epoch_mae_unscaled, global_step
+    """
     model.train()
-    total_loss = 0.0
-    total_abs_err_unscaled = 0.0
-    total_samples = 0
 
-    # Get device of the first parameter of the decoder for target y_scale device
-    # For LSTM, this will be CPU. For others, it will be the main device.
-    decoder_param_device = next(model.decoder.parameters()).device
+    total_loss, total_abs_err_unscaled, total_samples = 0.0, 0.0, 0
+    # 判定 label 所在设备
+    target_device = (next(model.Decoder.parameters()).device
+                     if hasattr(model, 'Decoder') else device)
 
-    pbar = tqdm(enumerate(train_loader), total=len(train_loader), desc=f"Epoch {epoch + 1}/{EPOCHS} [Train]")
+    pbar = tqdm(enumerate(train_loader),
+                total=len(train_loader),
+                desc=f"Epoch {epoch+1}/{EPOCHS} [Train]")
+
     for batch_idx, (X, y_scale, y_orig) in pbar:
-        X = X.to(device, dtype=torch.float32)  # Input to CNN encoder
-        y_scale_target = y_scale.to(decoder_param_device, dtype=torch.float32)  # Target on decoder's device
+        # -------------------------------------------------
+        # 1)  warm-up OR 调度器: 先算目标 lr，稍后真正写入
+        # -------------------------------------------------
+        if global_step < warmup_steps:       # 线性 warm-up
+            lr = base_lr * float(global_step + 1) / warmup_steps
+        else:                                # 交给 CosineAnnealingLR
+            lr = None            # 由 scheduler 决定
+
+        # -------------------------------------------------
+        # 2)  前向 + 反向
+        # -------------------------------------------------
+        X = X.to(device,  dtype=torch.float32)
+        y_scale = y_scale.to(target_device, dtype=torch.float32)
 
         optimizer.zero_grad()
-        output = model(X)  # Output will be on decoder_param_device
+        output = model(X)                    # forward
+        if output.device != y_scale.device:  # 防御性保障
+            output = output.to(y_scale.device)
 
-        loss = criterion(output, y_scale_target)
-        rmse_loss = torch.sqrt(loss)  # Original code uses sqrt of MSE
-        rmse_loss.backward()
+        loss = criterion(output, y_scale)    # MSE
+        rmse_loss = torch.sqrt(loss)         # RMSE
 
-        # Gradient clipping to prevent exploding gradients
-        torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+        loss.backward()
+        torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+        optimizer.step()                     # <-- 必须先优化器 step
+        # 检查梯度范数
+        grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+        if grad_norm < 0.01:
+            print(f"**Display: Warning: Gradient norm too small: {grad_norm:.4f}**")
 
-        optimizer.step()
+        # -------------------------------------------------
+        # 3)  再真正调整学习率
+        # -------------------------------------------------
+        if global_step < warmup_steps:
+            for pg in optimizer.param_groups:
+                pg['lr'] = lr                # 写入 warm-up lr
+        else:
+            main_scheduler.step()            # 退火
 
-        total_loss += rmse_loss.item() * X.size(0)
+        # -------------------------------------------------
+        # 4)  统计指标
+        # -------------------------------------------------
+        pred_unscaled = scaler.inverse_transform(
+            output.detach().cpu().numpy()
+        )
+        abs_err_unscaled = np.abs(pred_unscaled - y_orig.numpy())
 
-        # For error calculation on original scale
-        pred_unscaled = scaler.inverse_transform(output.detach().cpu().numpy())
-        abs_error_unscaled = np.abs(pred_unscaled - y_orig.numpy())
-        total_abs_err_unscaled += np.sum(abs_error_unscaled)
-        total_samples += X.size(0)
+        bs = X.size(0)
+        total_loss              += rmse_loss.item() * bs
+        total_abs_err_unscaled  += np.sum(abs_err_unscaled)
+        total_samples           += bs
+        global_step             += 1         # 关键：累加在循环最后
 
-        if (batch_idx + 1) % log_interval == 0 or (batch_idx + 1) == len(train_loader):
-            avg_loss_so_far = total_loss / total_samples
-            avg_mae_unscaled_so_far = total_abs_err_unscaled / total_samples
-            pbar.set_postfix_str(f"RMSE Loss: {avg_loss_so_far:.4f}, MAE (unscaled): {avg_mae_unscaled_so_far:.2f}")
+        # 动态进度条
+        if (batch_idx+1) % log_interval == 0 or (batch_idx+1) == len(train_loader):
+            pbar.set_postfix_str(
+                f"RMSE: {total_loss/total_samples:.4f}, "
+                f"MAE(unscaled): {total_abs_err_unscaled/total_samples:.2f}"
+            )
 
-    avg_epoch_loss = total_loss / total_samples
+    avg_epoch_loss         = total_loss / total_samples
     avg_epoch_mae_unscaled = total_abs_err_unscaled / total_samples
-    return avg_epoch_loss, avg_epoch_mae_unscaled
+    return avg_epoch_loss, avg_epoch_mae_unscaled, global_step
+
 
 
 def validate_epoch(model, device, val_loader, criterion, scaler, epoch=None):
@@ -299,7 +367,11 @@ def validate_epoch(model, device, val_loader, criterion, scaler, epoch=None):
     total_abs_err_unscaled = 0.0
     total_samples = 0
 
-    decoder_param_device = next(model.decoder.parameters()).device
+    # 设备选择逻辑与训练相同
+    if hasattr(model, 'Decoder'):
+        target_device = next(model.Decoder.parameters()).device
+    else:  # VideoTransformer
+        target_device = device
 
     desc_str = "Validation"
     if epoch is not None: desc_str = f"Epoch {epoch + 1}/{EPOCHS} [Val]"
@@ -308,9 +380,14 @@ def validate_epoch(model, device, val_loader, criterion, scaler, epoch=None):
     with torch.no_grad():
         for X, y_scale, y_orig in pbar:
             X = X.to(device, dtype=torch.float32)
-            y_scale_target = y_scale.to(decoder_param_device, dtype=torch.float32)
+            y_scale_target = y_scale.to(target_device, dtype=torch.float32)
 
             output = model(X)
+
+            # 确保输出和目标在同一设备上
+            if output.device != y_scale_target.device:
+                output = output.to(y_scale_target.device)
+
             loss = criterion(output, y_scale_target)
             rmse_loss = torch.sqrt(loss)
 
@@ -327,7 +404,8 @@ def validate_epoch(model, device, val_loader, criterion, scaler, epoch=None):
 
     avg_epoch_loss = total_loss / total_samples
     avg_epoch_mae_unscaled = total_abs_err_unscaled / total_samples
-    print(f"{desc_str} Results: Avg RMSE Loss: {avg_epoch_loss:.4f}, Avg MAE (unscaled): {avg_epoch_mae_unscaled:.2f}")
+    print(
+        f"**Display: {desc_str} Results: Avg RMSE Loss: {avg_epoch_loss:.4f}, Avg MAE (unscaled): {avg_epoch_mae_unscaled:.2f}**")
     return avg_epoch_loss, avg_epoch_mae_unscaled
 
 
@@ -472,25 +550,46 @@ def main(args):
 
     # Data
     train_loader, val_loader, test_loader, scaler = get_data_loaders(
-        data_path, args.batch_size, RANDOM_STATE, IMG_X, IMG_Y, args.dataset_type
+        data_path, args.batch_size, RANDOM_STATE, IMG_X, IMG_Y, args.dataset_type, args.n_frames
     )
 
     # Model
-    model = get_model(args.model_type, device)
+    model = get_model(args.model_type, args.n_frames, device)
 
     # Optimizer and Loss
-    optimizer = optim.AdamW(model.parameters(), lr=args.learning_rate)
+    # optimizer = optim.AdamW(model.parameters(), lr=args.learning_rate, weight_decay=1e-4)
+    optimizer = optim.AdamW(
+        [p for p in model.parameters() if p.requires_grad],
+        lr=3e-4,  # 调低学习率以保留预训练特征
+        weight_decay=1e-4
+    )
     criterion = nn.MSELoss()  # We will take sqrt for RMSE as in original code
+
+    # 5% warm-up + cosine
+    # 2. 设置带Warm-up的余弦退火调度器
+    total_steps = len(train_loader) * args.epochs
+    warmup_percentage = 0.05  # 使用5%的步数进行warm-up
+    warmup_steps = int(total_steps * warmup_percentage)
+
+    print(f"**Display: LR Scheduler enabled. Total steps: {total_steps}, Warm-up steps: {warmup_steps}.**")
+    main_scheduler = optim.lr_scheduler.CosineAnnealingLR(
+        optimizer,
+        T_max=total_steps - warmup_steps  # T_max是余弦退火的总步数
+    )
 
     # Training Loop
     epoch_train_losses, epoch_val_losses = [], []
     epoch_train_errors, epoch_val_errors = [], []  # Using MAE (unscaled) for error tracking
+    global_step = 0  # Initialize global step for scheduler
 
     print(
         f"\n**Display: Starting training for {args.model_type.upper()} model on {dataset_name} for {args.epochs} epochs...**")
     for epoch in range(args.epochs):
-        train_loss, train_error = train_epoch(
-            model, device, train_loader, optimizer, criterion, epoch, scaler, args.log_interval
+        train_loss, train_error, global_step = train_epoch(
+            model, device, train_loader, optimizer, criterion, epoch,
+            global_step=global_step, main_scheduler=main_scheduler,
+            warmup_steps=warmup_steps, base_lr=args.learning_rate,
+            scaler=scaler, log_interval=args.log_interval
         )
         val_loss, val_error = validate_epoch(
             model, device, val_loader, criterion, scaler, epoch
@@ -536,7 +635,7 @@ def main(args):
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser(description="Train and Evaluate CRNN-variant models for hardness estimation.")
-    parser.add_argument('--model_type', type=str, required=True, choices=['lstm', 'gru', 'transformer', 'tcn'],
+    parser.add_argument('--model_type', type=str, required=True, choices=['lstm', 'gru', 'transformer', 'tcn', 'video_tf'],
                         help="Type of decoder model to use (lstm, gru, transformer, tcn).")
     parser.add_argument('--dataset_type', type=str, required=True, choices=['dataset1', 'dataset2'],
                         help="Which dataset to use (dataset1: hardness5, dataset2: hardness10)")
@@ -548,6 +647,7 @@ if __name__ == '__main__':
                         help=f"Learning rate for the optimizer (default: {LEARNING_RATE}).")
     parser.add_argument('--log_interval', type=int, default=LOG_INTERVAL,
                         help=f"Log training progress every N batches (default: {LOG_INTERVAL}).")
+    parser.add_argument('--n_frames', type=int, default=10, help="Number of frames per sample (default: 10).")
 
     parsed_args = parser.parse_args()
 
@@ -556,5 +656,6 @@ if __name__ == '__main__':
     BATCH_SIZE = parsed_args.batch_size
     LEARNING_RATE = parsed_args.learning_rate
     LOG_INTERVAL = parsed_args.log_interval
+    N_FRAMES = parsed_args.n_frames
 
     main(parsed_args)

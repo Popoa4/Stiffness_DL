@@ -9,6 +9,7 @@ import torchvision.models as models
 import torchvision.transforms as transforms
 from tqdm import tqdm
 import math
+import timm
 
 ## ------------------- label conversion tools ------------------ ##
 def labels2cat(label_encoder, list):
@@ -26,42 +27,77 @@ def cat2labels(label_encoder, y_cat):
 
 ## ---------------------- Dataloaders ---------------------- ##
 class Dataset_CRNN(data.Dataset):
-    def __init__(self, data_path, folders, labels, gt, transform=None):
+    def __init__(self, data_path, folders, labels, gt, n_frames = 10, transform=None):
         self.data_path = data_path
         self.labels = labels
         self.gt_labels = gt
         self.folders = folders
         self.transform = transform
+        self.n_frames = n_frames
 
     def __len__(self):
         return len(self.folders)
 
     def read_images(self, path, selected_folder, use_transform):
-        X = []
+        """
+        始终返回 self.n_frames 张经过 transform 的图片：
+        1. 帧够用   → 均匀抽 self.n_frames 张
+        2. 帧不足   → 先取所有帧，再重复最后一帧补齐
+        3. 路径缺失 → 回退到最后一张成功读取的帧
+        """
         folder_path = os.path.join(path, selected_folder)
-        frame_files = sorted(os.listdir(folder_path))
+        # 只保留真正的图片文件，避免 .DS_Store 或其它杂项
+        frame_files = sorted([f for f in os.listdir(folder_path)
+                              if f.lower().endswith(('.jpg', '.png'))])
         frame_count = len(frame_files)
-        begin_frame = 0
-        end_frame = frame_count - 1
-        total_frames = 10
-        if frame_count < total_frames:
-            begin_frame = 0
-            end_frame = frame_count - 1
-            total_frames = frame_count
-        skip_frame = frame_count // total_frames
-        # print("Reading folder: {}, total frames: {}, skip frame: {}".format(
-        #     selected_folder, frame_count, skip_frame))
-        selected_frames = np.arange(begin_frame, end_frame + 1, skip_frame)
-        if len(selected_frames) > total_frames:
-            selected_frames = selected_frames[:total_frames]
-        selected_frames = selected_frames.tolist()
-        for i in selected_frames:
-            img_path = os.path.join(folder_path, 'frame_{:04d}.jpg'.format(i))
-            image = Image.open(img_path)
+        wanted = self.n_frames
+
+        if frame_count == 0:
+            raise RuntimeError(f'Folder {folder_path} 没有任何帧！')
+
+        # -------- 1) 生成要读取的帧索引 --------
+        if frame_count >= wanted:  # 帧数足够
+            # linspace 比 arange + skip_frame 更均匀也更直观
+            idx_array = np.linspace(0, frame_count - 1,
+                                    num=wanted, dtype=int)
+        else:  # 帧数不够
+            print(f'[Dataset Warning] {selected_folder} 只有 {frame_count} 帧，'
+                  f'需要 {wanted} 帧，自动复制最后一帧补齐。')
+            # 先拿到全部现有帧，再把最后一帧重复若干次
+            idx_array = np.concatenate([
+                np.arange(frame_count),
+                np.full(wanted - frame_count, frame_count - 1)
+            ]).astype(int)
+
+        # -------- 2) 读取并 transform --------
+        imgs = []
+        last_valid_img = None
+        for idx in idx_array:
+            # 试着用统一命名规则 `frame_xxxx.jpg`
+            img_path = os.path.join(folder_path, f'frame_{idx:04d}.jpg')
+            if not os.path.exists(img_path):  # 文件名不规范，退回列表索引
+                if idx < frame_count:
+                    img_path = os.path.join(folder_path, frame_files[idx])
+                else:  # 极少发生；用最后一张兜底
+                    img_path = os.path.join(folder_path, frame_files[-1])
+
+            try:
+                img = Image.open(img_path).convert('RGB')
+                last_valid_img = img
+            except Exception as e:  # 读不到就复制上一张
+                print(f'[Dataset Warning] 读取 {img_path} 失败：{e}')
+                if last_valid_img is None:
+                    # 如果第一张就失败，造一张黑图
+                    img = Image.new('RGB', (self.transform_size, self.transform_size))
+                else:
+                    img = last_valid_img
+
             if use_transform is not None:
-                image = use_transform(image)
-            X.append(image)
-        return torch.stack(X, dim=0)
+                img = use_transform(img)
+            imgs.append(img)
+
+        # -------- 3) 拼成 [wanted, C, H, W] --------
+        return torch.stack(imgs, dim=0)  # Tensor
 
     def __getitem__(self, index):
         folder = self.folders[index]
@@ -338,19 +374,142 @@ class DecoderTCN(nn.Module):
         return x
 
 
-# class Model(nn.Module):
-#     def __init__(self, EncoderCNN, Decoder):
-#         super().__init__()
-#         self.EncoderCNN = EncoderCNN
-#         self.Decoder = Decoder
-#
-#     def forward(self, x):
-#         # LSTM: Ensure the input is on the CPU for compatibility with MPS
-#         # return self.Decoder(self.EncoderCNN(x).to('cpu')).to('mps')
-#         # GRU: all on mps
-#         # transformer: all on mps
-#         return self.Decoder(self.EncoderCNN(x))
-# 其余内容完全不变，只贴出 Model
+# ------------- Video Vision Transformer (简化版 ViT + Time) -------------
+class PatchEmbedding(nn.Module):
+    """
+    把输入帧 (C,H,W) 切成 (N_patches, embed_dim) 向量
+    """
+
+    def __init__(self, img_size=224, patch_size=16, in_chans=3, embed_dim=768):
+        super().__init__()
+        self.img_size = img_size
+        self.patch_size = patch_size
+        self.n_patches = (img_size // patch_size) ** 2
+        # 用一个 Conv2d 做 unfold + linear projection
+        self.proj = nn.Conv2d(in_chans, embed_dim,
+                              kernel_size=patch_size,
+                              stride=patch_size)
+
+    def forward(self, x):  # x:[B, C, H, W]
+        x = self.proj(x)  # [B, embed_dim, H/ps, W/ps]
+        x = x.flatten(2)  # [B, embed_dim, N_patch]
+        x = x.transpose(1, 2)  # [B, N_patch, embed_dim]
+        return x  # Patch 序列
+
+
+class VideoTransformer(nn.Module):
+    """
+    采用时空分离注意力的Video Transformer（灵感来自TimeSformer）
+    *** 版本更新：使用 timm 加载预训练的 ViT 作为空间编码器 ***
+    """
+
+    def __init__(self,
+                 img_size=224,
+                 patch_size=16,
+                 n_frames=16,
+                 drop_p=0.1,
+                 pretrained_model_name='vit_base_patch16_224'):
+        super().__init__()
+        self.n_frames = n_frames
+
+        # 1. 加载预训练的 ViT 模型作为空间编码器
+        print(f"**Display: Loading pre-trained timm model: {pretrained_model_name}**")
+        timm_model = timm.create_model(pretrained_model_name, pretrained=True)
+
+        # 从预训练模型中"嫁接"我们需要的模块
+        self.patch_embed = timm_model.patch_embed
+        self.cls_token = timm_model.cls_token
+        self.pos_embed = timm_model.pos_embed
+        self.pos_drop = timm_model.pos_drop
+        self.spatial_blocks = timm_model.blocks
+
+        # 获取 embedding_dim
+        embed_dim = self.patch_embed.proj.out_channels
+        n_patches = self.patch_embed.num_patches
+
+        # 尝试获取注意力头的数量
+        try:
+            # 从第一个Transformer块的注意力层获取头数
+            num_heads = timm_model.blocks[0].attn.num_heads
+        except (AttributeError, IndexError):
+            # 如果获取失败，根据模型名称设置默认值
+            if 'base' in pretrained_model_name:
+                num_heads = 12
+            elif 'large' in pretrained_model_name:
+                num_heads = 16
+            elif 'small' in pretrained_model_name:
+                num_heads = 6
+            else:
+                num_heads = 8  # 默认值
+
+        print(f"**Display: Using {num_heads} attention heads for temporal transformer**")
+
+        # 2. 创建时间模块和回归头
+        self.time_embed = nn.Parameter(torch.zeros(1, n_frames, embed_dim))
+
+        # 使用获取的 num_heads 而不是 timm_model.n_heads
+        temporal_encoder_layer = nn.TransformerEncoderLayer(
+            d_model=embed_dim,
+            nhead=num_heads,  # 使用获取到的头数
+            dim_feedforward=int(embed_dim * 4.0),
+            dropout=drop_p,
+            batch_first=True
+        )
+
+        self.temporal_transformer = nn.TransformerEncoder(temporal_encoder_layer, num_layers=4)
+
+        # 回归头保持不变
+        self.head = nn.Sequential(
+            nn.LayerNorm(embed_dim),
+            nn.Linear(embed_dim, 1)
+        )
+
+        # 3. 初始化新创建的模块的权重
+        nn.init.trunc_normal_(self.time_embed, std=.02)
+        self.temporal_transformer.apply(self._init_weights)
+        self.head.apply(self._init_weights)
+
+    def _init_weights(self, m):
+        if isinstance(m, nn.Linear):
+            nn.init.trunc_normal_(m.weight, std=.02)
+            if m.bias is not None: nn.init.zeros_(m.bias)
+        elif isinstance(m, nn.LayerNorm):
+            nn.init.zeros_(m.bias)
+            nn.init.ones_(m.weight)
+
+    def forward(self, x):  # x: [B, F, C, H, W]
+        B, F, C, H, W = x.shape
+        assert F == self.n_frames, "输入帧数必须与模型的 n_frames 一致"
+
+        # --- 空间编码 (利用预训练模型) ---
+        x = x.reshape(B * F, C, H, W)
+        x = self.patch_embed(x)  # [B*F, N_patches, D]
+        n_patches = x.shape[1]
+
+        cls_tokens = self.cls_token.expand(B * F, -1, -1)
+        x = torch.cat((cls_tokens, x), dim=1)  # [B*F, N_patches+1, D]
+        x = x + self.pos_embed
+        x = self.pos_drop(x)
+
+        # 通过预训练的 Transformer blocks
+        x = self.spatial_blocks(x)  # [B*F, N_patches+1, D]
+
+        # --- 时间编码 (利用我们自定义的模块) ---
+        cls_tokens = x[:, 0].reshape(B, F, -1)  # [B, F, D]
+
+        # 添加时间位置编码
+        cls_tokens = cls_tokens + self.time_embed
+
+        # 通过时间 Transformer
+        time_output = self.temporal_transformer(cls_tokens)  # [B, F, D]
+
+        # --- 聚合与预测 ---
+        # 使用最后一个时间步的 CLS token 作为整个视频的表征
+        final_feature = time_output[:, -1]
+
+        pred = self.head(final_feature)
+        return pred
+
 
 class Model(nn.Module):
     """

@@ -1,0 +1,7 @@
+Test Results for model: lstm, dataset: hardness1Data
+Checkpoint: ./checkpoints/lstm_hardness1Data/lstm_hardness1Data_epoch_50.pth
+RMSE (unscaled): 16.0311
+MAE (unscaled): 11.1364
+R2 Score: 0.6855
+Mean Relative Error (MRE): 47.11%
+Number of test samples: 1342
