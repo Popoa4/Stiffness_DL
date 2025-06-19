@@ -43,7 +43,7 @@ DEF_RESULTS_DIR = "./results"
 CNN_FC_HIDDEN1, CNN_FC_HIDDEN2 = 512, 348
 CNN_EMBED_DIM = 256
 IMG_X, IMG_Y = 224, 224  # Image dimensions
-DROPOUT_P = 0.1
+DROPOUT_P = 0
 # RNN/Transformer/TCN Params
 SEQ_LEN = 10  # Number of frames per sample, crucial for PositionalEncoding and TCN
 RNN_HIDDEN_LAYERS = 1
@@ -55,7 +55,7 @@ TCN_NUM_LEVELS = 3
 TCN_KERNEL_SIZE = 3
 
 # Training Params
-EPOCHS = 50
+EPOCHS = 200
 BATCH_SIZE = 16
 LEARNING_RATE = 1e-4
 LOG_INTERVAL = 10  # Print training log every N batches
@@ -204,20 +204,14 @@ def get_model(model_type: str, n_frames, device):
         # print(f"**Display: Initializing VideoTransformer model with {n_frames} frames per sample.**")
         model = VideoTransformer(
             img_size=IMG_X,
-            patch_size=16,
+            patch_size=16,  # Assuming patch size of 16 for ViT
             n_frames=n_frames,
-            pretrained_model_name='vit_small_patch16_224',  # 小型ViT (22M参数)
-            # 也可以尝试: 'vit_base_patch16_224' (大型, 86M参数)
-            # 或 'vit_tiny_patch16_224' (更小, 仅6M参数)
+            embed_dim=CNN_EMBED_DIM,
+            depth=2,  # Number of transformer layers
+            n_head=2,  # Number of attention heads
+            mlp_ratio=4.0,  # MLP ratio for transformer
             drop_p=DROPOUT_P
         ).to(device)
-        # 选择性冻结预训练部分
-        for name, param in model.named_parameters():
-            # 只训练时间Transformer、时间位置编码和回归头
-            if 'temporal' in name or 'time_embed' in name or 'head' in name:
-                param.requires_grad = True
-            else:
-                param.requires_grad = False
         return model
     # --- Encoder (始终在主设备) ---
     cnn_encoder = EncoderCNN(
@@ -328,11 +322,11 @@ def train_epoch(
         # -------------------------------------------------
         # 3)  再真正调整学习率
         # -------------------------------------------------
-        if global_step < warmup_steps:
-            for pg in optimizer.param_groups:
-                pg['lr'] = lr                # 写入 warm-up lr
-        else:
-            main_scheduler.step()            # 退火
+        # if global_step < warmup_steps:
+        #     for pg in optimizer.param_groups:
+        #         pg['lr'] = lr                # 写入 warm-up lr
+        # else:
+        #     main_scheduler.step()            # 退火
 
         # -------------------------------------------------
         # 4)  统计指标
@@ -555,13 +549,17 @@ def main(args):
 
     # Model
     model = get_model(args.model_type, args.n_frames, device)
+    # 冻结早期层
+    for name, p in model.named_parameters():
+        if not name.startswith(("temporal_transformer.layers.1", "head")):
+            p.requires_grad = False
 
     # Optimizer and Loss
     # optimizer = optim.AdamW(model.parameters(), lr=args.learning_rate, weight_decay=1e-4)
     optimizer = optim.AdamW(
         [p for p in model.parameters() if p.requires_grad],
         lr=3e-4,  # 调低学习率以保留预训练特征
-        weight_decay=1e-4
+        weight_decay=0
     )
     criterion = nn.MSELoss()  # We will take sqrt for RMSE as in original code
 

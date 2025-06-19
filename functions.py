@@ -9,7 +9,6 @@ import torchvision.models as models
 import torchvision.transforms as transforms
 from tqdm import tqdm
 import math
-import timm
 
 ## ------------------- label conversion tools ------------------ ##
 def labels2cat(label_encoder, list):
@@ -399,75 +398,61 @@ class PatchEmbedding(nn.Module):
 
 class VideoTransformer(nn.Module):
     """
-    采用时空分离注意力的Video Transformer（灵感来自TimeSformer）
-    *** 版本更新：使用 timm 加载预训练的 ViT 作为空间编码器 ***
+    采用时空分离注意力的Video Transformer，灵感来自TimeSformer。
+    1. 先在每帧内部做空间注意力。
+    2. 再在不同帧之间做时间注意力。
     """
-
     def __init__(self,
                  img_size=224,
                  patch_size=16,
-                 n_frames=16,
-                 drop_p=0.1,
-                 pretrained_model_name='vit_base_patch16_224'):
+                 n_frames=32,
+                 embed_dim=768,
+                 depth=8,  # 总深度，会平分给空间和时间
+                 n_head=8,
+                 mlp_ratio=4.,
+                 drop_p=0.1):
         super().__init__()
         self.n_frames = n_frames
+        self.patch_embed = PatchEmbedding(img_size, patch_size, 3, embed_dim)
+        self.cls_token = nn.Parameter(torch.zeros(1, 1, embed_dim))
 
-        # 1. 加载预训练的 ViT 模型作为空间编码器
-        print(f"**Display: Loading pre-trained timm model: {pretrained_model_name}**")
-        timm_model = timm.create_model(pretrained_model_name, pretrained=True)
+        # 时空位置编码：需要分别为时间和空间创建
+        n_patches = self.patch_embed.n_patches
+        self.pos_embed = nn.Parameter(torch.zeros(1, n_patches + 1, embed_dim)) # 空间位置编码
+        self.time_embed = nn.Parameter(torch.zeros(1, n_frames, embed_dim))     # 时间位置编码
+        self.pos_drop = nn.Dropout(p=drop_p)
 
-        # 从预训练模型中"嫁接"我们需要的模块
-        self.patch_embed = timm_model.patch_embed
-        self.cls_token = timm_model.cls_token
-        self.pos_embed = timm_model.pos_embed
-        self.pos_drop = timm_model.pos_drop
-        self.spatial_blocks = timm_model.blocks
+        # 将总深度(depth)平分给空间和时间Transformer
+        d_spatial = depth // 2
+        d_temporal = depth - d_spatial
 
-        # 获取 embedding_dim
-        embed_dim = self.patch_embed.proj.out_channels
-        n_patches = self.patch_embed.num_patches
-
-        # 尝试获取注意力头的数量
-        try:
-            # 从第一个Transformer块的注意力层获取头数
-            num_heads = timm_model.blocks[0].attn.num_heads
-        except (AttributeError, IndexError):
-            # 如果获取失败，根据模型名称设置默认值
-            if 'base' in pretrained_model_name:
-                num_heads = 12
-            elif 'large' in pretrained_model_name:
-                num_heads = 16
-            elif 'small' in pretrained_model_name:
-                num_heads = 6
-            else:
-                num_heads = 8  # 默认值
-
-        print(f"**Display: Using {num_heads} attention heads for temporal transformer**")
-
-        # 2. 创建时间模块和回归头
-        self.time_embed = nn.Parameter(torch.zeros(1, n_frames, embed_dim))
-
-        # 使用获取的 num_heads 而不是 timm_model.n_heads
-        temporal_encoder_layer = nn.TransformerEncoderLayer(
-            d_model=embed_dim,
-            nhead=num_heads,  # 使用获取到的头数
-            dim_feedforward=int(embed_dim * 4.0),
-            dropout=drop_p,
-            batch_first=True
+        # 空间Transformer编码器
+        spatial_encoder_layer = nn.TransformerEncoderLayer(
+            d_model=embed_dim, nhead=n_head,
+            dim_feedforward=int(embed_dim * mlp_ratio),
+            dropout=drop_p, batch_first=True
         )
+        self.spatial_transformer = nn.TransformerEncoder(spatial_encoder_layer, num_layers=d_spatial)
 
-        self.temporal_transformer = nn.TransformerEncoder(temporal_encoder_layer, num_layers=4)
+        # 时间Transformer编码器
+        temporal_encoder_layer = nn.TransformerEncoderLayer(
+            d_model=embed_dim, nhead=n_head,
+            dim_feedforward=int(embed_dim * mlp_ratio),
+            dropout=drop_p, batch_first=True
+        )
+        self.temporal_transformer = nn.TransformerEncoder(temporal_encoder_layer, num_layers=d_temporal)
 
-        # 回归头保持不变
+        # 回归头
         self.head = nn.Sequential(
             nn.LayerNorm(embed_dim),
             nn.Linear(embed_dim, 1)
         )
 
-        # 3. 初始化新创建的模块的权重
+        # 参数初始化
+        nn.init.trunc_normal_(self.pos_embed, std=.02)
         nn.init.trunc_normal_(self.time_embed, std=.02)
-        self.temporal_transformer.apply(self._init_weights)
-        self.head.apply(self._init_weights)
+        nn.init.trunc_normal_(self.cls_token, std=.02)
+        self.apply(self._init_weights)
 
     def _init_weights(self, m):
         if isinstance(m, nn.Linear):
@@ -481,32 +466,50 @@ class VideoTransformer(nn.Module):
         B, F, C, H, W = x.shape
         assert F == self.n_frames, "输入帧数必须与模型的 n_frames 一致"
 
-        # --- 空间编码 (利用预训练模型) ---
+        # 1. Patch Embedding
+        # 将 [B, F, C, H, W] -> [B*F, C, H, W]
         x = x.reshape(B * F, C, H, W)
         x = self.patch_embed(x)  # [B*F, N_patches, D]
         n_patches = x.shape[1]
 
-        cls_tokens = self.cls_token.expand(B * F, -1, -1)
-        x = torch.cat((cls_tokens, x), dim=1)  # [B*F, N_patches+1, D]
+        # 2. 添加CLS Token 和 空间位置编码
+        cls_tokens = self.cls_token.expand(B * F, -1, -1)  # [B*F, 1, D]
+        x = torch.cat((cls_tokens, x), dim=1) # [B*F, N_patches+1, D]
         x = x + self.pos_embed
-        x = self.pos_drop(x)
 
-        # 通过预训练的 Transformer blocks
-        x = self.spatial_blocks(x)  # [B*F, N_patches+1, D]
+        # 3. 空间注意力
+        x = self.spatial_transformer(x) # [B*F, N_patches+1, D]
 
-        # --- 时间编码 (利用我们自定义的模块) ---
-        cls_tokens = x[:, 0].reshape(B, F, -1)  # [B, F, D]
+        # 4. 时间注意力准备
+        # 将CLS Token分离出来，因为它只参与时间维度的最终预测
+        cls_tokens = x[:, 0, :].reshape(B, F, -1) # [B, F, D]
+
+        # 将patch token的形状变回来，准备时间注意力
+        x_patches = x[:, 1:, :].reshape(B, F, n_patches, -1) # [B, F, N, D]
+        # 维度换位，让时间(F)成为序列长度
+        # [B, F, N, D] -> [B, N, F, D] -> [B*N, F, D]
+        x_patches = x_patches.permute(0, 2, 1, 3).reshape(B * n_patches, F, -1)
 
         # 添加时间位置编码
-        cls_tokens = cls_tokens + self.time_embed
+        x_patches = x_patches + self.time_embed
 
-        # 通过时间 Transformer
-        time_output = self.temporal_transformer(cls_tokens)  # [B, F, D]
+        # 5. 时间注意力
+        x_patches = self.temporal_transformer(x_patches) # [B*N, F, D]
 
-        # --- 聚合与预测 ---
-        # 使用最后一个时间步的 CLS token 作为整个视频的表征
-        final_feature = time_output[:, -1]
+        # 6. 数据整合与预测
+        # 将处理后的patch在时间维度上取平均，得到一个代表视频动态的特征
+        # 另一种方法是也加一个时间的CLS token，这里用平均更简单
+        video_feature = x_patches.mean(dim=1).reshape(B, n_patches, -1).mean(dim=1) # [B, D]
 
+        # 将CLS token在时间维度上取平均
+        cls_feature = cls_tokens.mean(dim=1) # [B, D]
+
+        # 融合特征（简单相加或拼接）
+        # final_feature = (video_feature + cls_feature) / 2
+        # final_feature = video_feature
+        final_feature = cls_feature
+
+        # 7. 回归头
         pred = self.head(final_feature)
         return pred
 
