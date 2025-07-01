@@ -1,0 +1,7 @@
+Test Results for model: gru, dataset: hardness1Data
+Checkpoint: ./checkpoints/gru_hardness1Data/gru_hardness1Data_epoch_30.pth
+RMSE (unscaled): 16.6928
+MAE (unscaled): 11.2087
+R2 Score: 0.6590
+Mean Relative Error (MRE): 55.94%
+Number of test samples: 1342

@@ -6,6 +6,7 @@ import torch
 import torch.nn as nn
 import torch.optim as optim
 from torch.utils.data import DataLoader
+from torch.utils.tensorboard import SummaryWriter # <-- 添加这一行
 import torchvision.transforms as transforms
 from sklearn.model_selection import train_test_split
 from sklearn.preprocessing import StandardScaler
@@ -55,10 +56,10 @@ TCN_NUM_LEVELS = 3
 TCN_KERNEL_SIZE = 3
 
 # Training Params
-EPOCHS = 200
+EPOCHS = 400
 BATCH_SIZE = 16
 LEARNING_RATE = 1e-4
-LOG_INTERVAL = 10  # Print training log every N batches
+LOG_INTERVAL = 25  # Print training log every N batches
 RANDOM_STATE = 42  # For reproducible splits
 
 
@@ -206,9 +207,9 @@ def get_model(model_type: str, n_frames, device):
             img_size=IMG_X,
             patch_size=16,  # Assuming patch size of 16 for ViT
             n_frames=n_frames,
-            embed_dim=CNN_EMBED_DIM,
-            depth=2,  # Number of transformer layers
-            n_head=2,  # Number of attention heads
+            embed_dim=128,
+            depth=6,  # Number of transformer layers
+            n_head=4,  # Number of attention heads
             mlp_ratio=4.0,  # MLP ratio for transformer
             drop_p=DROPOUT_P
         ).to(device)
@@ -262,17 +263,9 @@ def get_model(model_type: str, n_frames, device):
     return Model(cnn_encoder, decoder, model_type)
 
 
-def train_epoch(
-        model, device, train_loader,
-        optimizer, criterion,
-        epoch,                     # 当前 epoch 索引
-        global_step,               # 上一个 epoch 结束时的步数
-        main_scheduler,            # CosineAnnealingLR
-        warmup_steps,              # warm-up 总步数
-        base_lr,                   # 用户设定学习率
-        scaler,                    # label 的 StandardScaler
-        log_interval               # 打印频率
-    ):
+def train_epoch(model, device, train_loader, optimizer, criterion, epoch, scaler, log_interval
+                # global_step, warmup_steps, base_lr, main_scheduler
+                ):
     """
     返 回:
         avg_epoch_loss, avg_epoch_mae_unscaled, global_step
@@ -291,12 +284,17 @@ def train_epoch(
     for batch_idx, (X, y_scale, y_orig) in pbar:
         # -------------------------------------------------
         # 1)  warm-up OR 调度器: 先算目标 lr，稍后真正写入
-        # -------------------------------------------------
-        if global_step < warmup_steps:       # 线性 warm-up
-            lr = base_lr * float(global_step + 1) / warmup_steps
-        else:                                # 交给 CosineAnnealingLR
-            lr = None            # 由 scheduler 决定
-
+        # if global_step < warmup_steps:
+        #     # --- Warm-up 阶段 ---
+        #     # 线性增加学习率
+        #     lr_scale = float(global_step + 1) / float(max(1, warmup_steps))
+        #     for pg in optimizer.param_groups:
+        #         pg['lr'] = base_lr * lr_scale
+        # else:
+        #     # --- Cosine Annealing 阶段 ---
+        #     # Warm-up结束后，由主调度器接管
+        #     # 我们在 optimizer.step() 之后调用 scheduler.step()
+        #     pass  # 占位，实际操作在 optimizer.step() 之后
         # -------------------------------------------------
         # 2)  前向 + 反向
         # -------------------------------------------------
@@ -315,18 +313,15 @@ def train_epoch(
         torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
         optimizer.step()                     # <-- 必须先优化器 step
         # 检查梯度范数
-        grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
-        if grad_norm < 0.01:
-            print(f"**Display: Warning: Gradient norm too small: {grad_norm:.4f}**")
+        # grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+        # if grad_norm < 0.01:
+        #     print(f"**Display: Warning: Gradient norm too small: {grad_norm:.4f}**")
 
         # -------------------------------------------------
-        # 3)  再真正调整学习率
+        # 3)  在优化器更新之后，调用调度器
         # -------------------------------------------------
-        # if global_step < warmup_steps:
-        #     for pg in optimizer.param_groups:
-        #         pg['lr'] = lr                # 写入 warm-up lr
-        # else:
-        #     main_scheduler.step()            # 退火
+        # if global_step >= warmup_steps:
+        #     main_scheduler.step()
 
         # -------------------------------------------------
         # 4)  统计指标
@@ -340,7 +335,7 @@ def train_epoch(
         total_loss              += rmse_loss.item() * bs
         total_abs_err_unscaled  += np.sum(abs_err_unscaled)
         total_samples           += bs
-        global_step             += 1         # 关键：累加在循环最后
+        # global_step             += 1         # 关键：累加在循环最后
 
         # 动态进度条
         if (batch_idx+1) % log_interval == 0 or (batch_idx+1) == len(train_loader):
@@ -351,7 +346,7 @@ def train_epoch(
 
     avg_epoch_loss         = total_loss / total_samples
     avg_epoch_mae_unscaled = total_abs_err_unscaled / total_samples
-    return avg_epoch_loss, avg_epoch_mae_unscaled, global_step
+    return avg_epoch_loss, avg_epoch_mae_unscaled
 
 
 
@@ -407,18 +402,28 @@ def test_model_and_save_results(model, device, test_loader, scaler, model_name, 
                                 checkpoint_path=None):
     if checkpoint_path:
         print(f"**Display: Loading model from {checkpoint_path} for testing.**")
-        try:
+
+        # 检查模型类型以使用正确的加载逻辑
+        if hasattr(model, 'decoder'):  # Case 1: Old model structure (Encoder+Decoder)
+            print("**Display: Detected legacy model structure (Encoder+Decoder). Using careful loading.**")
+            try:
+                # 尝试标准加载
+                model.load_state_dict(torch.load(checkpoint_path, map_location=device))
+            except RuntimeError as e:
+                # 如果失败（例如LSTM在CPU上），则使用特殊加载
+                print(f"Standard load failed ({e}), attempting careful load for mixed devices (e.g. LSTM)...")
+                state_dict = torch.load(checkpoint_path, map_location=torch.device('cpu'))
+                model.load_state_dict(state_dict)
+                # 确保模块在加载后位于其指定设备上
+                model.encoder.to(device)
+                if model.model_type == 'lstm':
+                    model.decoder.to(torch.device('cpu'))
+                else:
+                    model.decoder.to(device)
+        else:  # Case 2: New standalone model (like VideoTransformer)
+            print("**Display: Detected standalone model structure (e.g., VideoTransformer). Using standard loading.**")
             model.load_state_dict(torch.load(checkpoint_path, map_location=device))
-        except RuntimeError as e:
-            print(f"Standard load failed ({e}), attempting careful load for mixed devices (e.g. LSTM)...")
-            state_dict = torch.load(checkpoint_path, map_location=torch.device('cpu'))
-            model.load_state_dict(state_dict)
-            # Ensure modules are on their designated devices after loading
-            model.EncoderCNN.to(device)
-            if model.model_type == 'lstm':
-                model.decoder.to(torch.device('cpu'))
-            else:
-                model.decoder.to(device)
+
         print(f"**Display: Model loaded from {checkpoint_path} successfully.**")
 
     model.eval()
@@ -427,14 +432,14 @@ def test_model_and_save_results(model, device, test_loader, scaler, model_name, 
     all_scaled_predictions = []
     all_scaled_true = []
 
-    decoder_param_device = next(model.decoder.parameters()).device
+    # decoder_param_device = ... # <-- 已删除：此变量不再需要且会导致错误
 
     print("**Display: Starting testing phase...**")
     pbar = tqdm(test_loader, total=len(test_loader), desc="Testing")
     with torch.no_grad():
         for X, y_scale, y_orig in pbar:
             X = X.to(device, dtype=torch.float32)
-            output_scaled = model(X)  # Scaled output from model
+            output_scaled = model(X)
 
             pred_unscaled = scaler.inverse_transform(output_scaled.detach().cpu().numpy())
 
@@ -443,6 +448,7 @@ def test_model_and_save_results(model, device, test_loader, scaler, model_name, 
             all_scaled_predictions.extend(output_scaled.detach().cpu().numpy().flatten().tolist())
             all_scaled_true.extend(y_scale.numpy().flatten().tolist())
 
+    # --- 后续的指标计算和保存部分无需修改，保持原样即可 ---
     # Calculate metrics
     true_np = np.array(all_true_values_unscaled)
     pred_np = np.array(all_predictions_unscaled)
@@ -452,7 +458,6 @@ def test_model_and_save_results(model, device, test_loader, scaler, model_name, 
     mae = mean_absolute_error(true_np, pred_np)
     r2 = r2_score(true_np, pred_np)
 
-    # Relative error calculation
     non_zero_mask = true_np != 0
     if np.sum(non_zero_mask) == 0:
         mre = float('inf')
@@ -475,20 +480,17 @@ def test_model_and_save_results(model, device, test_loader, scaler, model_name, 
         f"Mean Relative Error (MRE): {mre * 100:.2f}%\n"
         f"Number of test samples: {len(true_np)}\n"
     )
-
     metrics_path = os.path.join(dirs["predictions_dir"], f"{model_name}_{dataset_name}_test_metrics.txt")
     with open(metrics_path, "w") as f:
         f.write(metrics_summary)
     print(f"**Display: Test metrics saved to {metrics_path}**")
 
-    # Save predictions
     df_predictions = pd.DataFrame({
         'true_value_unscaled': all_true_values_unscaled,
         'predicted_value_unscaled': all_predictions_unscaled,
         'true_value_scaled': all_scaled_true,
         'predicted_value_scaled': all_scaled_predictions
     })
-
     predictions_path = os.path.join(dirs["predictions_dir"], f"{model_name}_{dataset_name}_test_predictions.csv")
     df_predictions.to_csv(predictions_path, index=False)
     print(f"**Display: Test predictions saved to {predictions_path}**")
@@ -524,6 +526,7 @@ def plot_metrics(epochs_ran, train_losses, val_losses, train_errors, val_errors,
     print(f"**Display: Training curves plot saved to {plot_filename}**")
 
 
+
 def main(args):
     # Get dataset information based on selection
     dataset_info = DATASET_OPTIONS.get(args.dataset_type)
@@ -546,48 +549,59 @@ def main(args):
     train_loader, val_loader, test_loader, scaler = get_data_loaders(
         data_path, args.batch_size, RANDOM_STATE, IMG_X, IMG_Y, args.dataset_type, args.n_frames
     )
+    # ========================================================================
+    # ### 1. 初始化 TensorBoard Writer (在创建目录后) ###
+    # 它会在你的 logs_dir 中创建一个新的 'runs' 子目录来存放日志
+    writer = SummaryWriter(log_dir=dirs["logs_dir"])
+    # ========================================================================
 
     # Model
     model = get_model(args.model_type, args.n_frames, device)
     # 冻结早期层
-    for name, p in model.named_parameters():
-        if not name.startswith(("temporal_transformer.layers.1", "head")):
-            p.requires_grad = False
+    # for name, p in model.named_parameters():
+    #     if not name.startswith(("temporal_transformer.layers.1", "head")):
+    #         p.requires_grad = False
 
     # Optimizer and Loss
-    # optimizer = optim.AdamW(model.parameters(), lr=args.learning_rate, weight_decay=1e-4)
-    optimizer = optim.AdamW(
-        [p for p in model.parameters() if p.requires_grad],
-        lr=3e-4,  # 调低学习率以保留预训练特征
-        weight_decay=0
-    )
+    optimizer = optim.AdamW(model.parameters(), lr=args.learning_rate, weight_decay=1e-2)
+
+    # optimizer = optim.AdamW(
+    #     [p for p in model.parameters() if p.requires_grad],
+    #     lr=3e-4,  # 调低学习率以保留预训练特征
+    #     weight_decay=0
+    # )
     criterion = nn.MSELoss()  # We will take sqrt for RMSE as in original code
 
     # 5% warm-up + cosine
     # 2. 设置带Warm-up的余弦退火调度器
-    total_steps = len(train_loader) * args.epochs
-    warmup_percentage = 0.05  # 使用5%的步数进行warm-up
-    warmup_steps = int(total_steps * warmup_percentage)
-
-    print(f"**Display: LR Scheduler enabled. Total steps: {total_steps}, Warm-up steps: {warmup_steps}.**")
-    main_scheduler = optim.lr_scheduler.CosineAnnealingLR(
-        optimizer,
-        T_max=total_steps - warmup_steps  # T_max是余弦退火的总步数
-    )
+    # total_steps = len(train_loader) * args.epochs
+    # warmup_percentage = 0.1  # 使用10%的步数进行warm-up
+    # warmup_steps = int(total_steps * warmup_percentage)
+    #
+    # print(f"**Display: LR Scheduler enabled. Total steps: {total_steps}, Warm-up steps: {warmup_steps}.**")
+    # main_scheduler = optim.lr_scheduler.CosineAnnealingLR(
+    #     optimizer,
+    #     T_max=total_steps - warmup_steps  # T_max是余弦退火的总步数
+    # )
 
     # Training Loop
     epoch_train_losses, epoch_val_losses = [], []
     epoch_train_errors, epoch_val_errors = [], []  # Using MAE (unscaled) for error tracking
-    global_step = 0  # Initialize global step for scheduler
+    # global_step = 0  # Initialize global step for scheduler
 
     print(
         f"\n**Display: Starting training for {args.model_type.upper()} model on {dataset_name} for {args.epochs} epochs...**")
     for epoch in range(args.epochs):
-        train_loss, train_error, global_step = train_epoch(
+        # train_loss, train_error, global_step = train_epoch(
+        #     model, device, train_loader, optimizer, criterion, epoch,
+        #     global_step=global_step, main_scheduler=main_scheduler,
+        #     warmup_steps=warmup_steps, base_lr=args.learning_rate,
+        #     scaler=scaler, log_interval=args.log_interval
+        # )
+        train_loss, train_error = train_epoch(
             model, device, train_loader, optimizer, criterion, epoch,
-            global_step=global_step, main_scheduler=main_scheduler,
-            warmup_steps=warmup_steps, base_lr=args.learning_rate,
             scaler=scaler, log_interval=args.log_interval
+            # global_step=global_step, warmup_steps=warmup_steps, base_lr=args.learning_rate, main_scheduler=main_scheduler
         )
         val_loss, val_error = validate_epoch(
             model, device, val_loader, criterion, scaler, epoch
@@ -597,6 +611,20 @@ def main(args):
         epoch_val_losses.append(val_loss)
         epoch_train_errors.append(train_error)
         epoch_val_errors.append(val_error)
+
+        # ========================================================================
+        # ### 2. 在每个 epoch 后将数据写入 TensorBoard ###
+        # 记录损失 (将训练和验证损失画在同一张图上)
+        writer.add_scalar('Loss/Train_RMSE', train_loss, epoch)
+        writer.add_scalar('Loss/Validation_RMSE', val_loss, epoch)
+
+        # 记录误差 (将训练和验证误差画在另一张图上)
+        writer.add_scalar('Error/Train_MAE_Unscaled', train_error, epoch)
+        writer.add_scalar('Error/Validation_MAE_Unscaled', val_error, epoch)
+
+        # 记录学习率 (如果未来加回调度器，这会很有用)
+        # writer.add_scalar('Learning_Rate', optimizer.param_groups[0]['lr'], epoch)
+        # ========================================================================
 
         # Save model checkpoint every 10 epochs or at the end
         if (epoch + 1) % 10 == 0 or (epoch + 1) == args.epochs:
@@ -617,6 +645,11 @@ def main(args):
         df_logs.to_csv(log_path, index_label="epoch")
 
     print("**Display: Training finished.**")
+    # ========================================================================
+    # ### 3. 训练结束后关闭 writer ###
+    writer.close()
+    print("**Display: TensorBoard log saved.**")
+    # ========================================================================
 
     # Plot training curves
     plot_metrics(args.epochs, epoch_train_losses, epoch_val_losses,

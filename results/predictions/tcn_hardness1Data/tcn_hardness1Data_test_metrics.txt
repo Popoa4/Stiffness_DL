@@ -1,0 +1,7 @@
+Test Results for model: tcn, dataset: hardness1Data
+Checkpoint: ./checkpoints/tcn_hardness1Data/tcn_hardness1Data_epoch_30.pth
+RMSE (unscaled): 16.7015
+MAE (unscaled): 12.7140
+R2 Score: 0.6586
+Mean Relative Error (MRE): 65.18%
+Number of test samples: 1342

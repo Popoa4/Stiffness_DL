@@ -1,0 +1,7 @@
+Test Results for model: video_tf, dataset: hardness5
+Checkpoint: ./checkpoints/video_tf_hardness5/video_tf_hardness5_epoch_400.pth
+RMSE (unscaled): 3.1778
+MAE (unscaled): 1.5468
+R2 Score: 0.9351
+Mean Relative Error (MRE): 4.97%
+Number of test samples: 251

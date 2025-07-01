@@ -16,7 +16,8 @@ device = (torch.device("cuda") if torch.cuda.is_available()
           else torch.device("cpu"))
 print(">>> Device :", device)
 
-data_path  = "/Users/ethanshao/Desktop/ucl/research project/Stiffness_DL/Dataset/hardness_5_2024_03_03"
+# data_path  = "/Users/ethanshao/Desktop/ucl/research project/Stiffness_DL/Dataset/hardness_5_2024_03_03"
+data_path = "/Users/ethanshao/Desktop/ucl/research project/Stiffness_DL/Dataset/hardness-1Data"  # Second dataset path
 ckpt_path  = "./model30_TCN.pth"          # 模型文件
 assert os.path.exists(ckpt_path), f"模型文件 {ckpt_path} 不存在!"
 

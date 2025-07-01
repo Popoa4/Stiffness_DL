@@ -1,0 +1,7 @@
+Test Results for model: transformer, dataset: hardness1Data
+Checkpoint: ./checkpoints/transformer_hardness1Data/transformer_hardness1Data_epoch_30.pth
+RMSE (unscaled): 17.6122
+MAE (unscaled): 11.8909
+R2 Score: 0.6204
+Mean Relative Error (MRE): 50.59%
+Number of test samples: 1342
