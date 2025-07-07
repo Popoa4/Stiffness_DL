@@ -1,5 +1,7 @@
 import os
 import argparse
+from collections import defaultdict
+
 import numpy as np
 import pandas as pd
 import torch
@@ -36,6 +38,7 @@ DEF_CHECKPOINT_DIR = "./checkpoints"
 DEF_RESULTS_DIR = "./results"
 IMG_X, IMG_Y = 224, 224
 RANDOM_STATE = 42  # **关键：固定的随机种子确保测试集始终相同**
+GROUPS_TO_FIND = ['FLAT', 'EDGE', 'CORNER', 'SPHERE', 'CYLIND', 'BASIC', 'SHELL', 'CHOCO']
 
 
 # ===================================================================
@@ -81,7 +84,7 @@ def get_data_loaders(data_path, batch_size, random_state, img_x, img_y, dataset_
     它会返回测试集加载器 (test_loader) 和在训练集上拟合好的标准化器 (scaler)。
     """
     print(f"**Display: 加载并分割数据来源: {data_path}**")
-    all_Y_list_raw, all_X_list_fnames = [], []
+    all_Y_list_raw, all_X_list_fnames, all_X_groups = [], [], []
     fnames = sorted(
         [f for f in os.listdir(data_path) if not f.startswith('.') and os.path.isdir(os.path.join(data_path, f))])
 
@@ -92,6 +95,14 @@ def get_data_loaders(data_path, batch_size, random_state, img_x, img_y, dataset_
             label = int(f_dir[label_start_idx:label_end_idx])
             all_Y_list_raw.append(label)
             all_X_list_fnames.append(f_dir)
+
+            # 从文件夹名称中解析组别
+            group_found = "UNKNOWN"
+            for group_name in GROUPS_TO_FIND:
+                if group_name in f_dir.upper():
+                    group_found = group_name
+                    break
+            all_X_groups.append(group_found)
         except (ValueError, IndexError):
             continue
 
@@ -100,8 +111,8 @@ def get_data_loaders(data_path, batch_size, random_state, img_x, img_y, dataset_
     all_Y_list_raw = np.array(all_Y_list_raw, dtype=np.float32).reshape(-1, 1)
 
     # 关键分割步骤：与训练脚本完全一致
-    X_train_val, X_test, Y_train_val_raw, Y_test_raw = train_test_split(all_X_list_fnames, all_Y_list_raw,
-                                                                        test_size=0.20, random_state=random_state)
+    X_train_val, X_test, Y_train_val_raw, Y_test_raw, G_train_val, G_test = train_test_split(
+        all_X_list_fnames, all_Y_list_raw, all_X_groups, test_size=0.20, random_state=random_state)
     X_train, _, Y_train_raw, _ = train_test_split(X_train_val, Y_train_val_raw, test_size=0.25,
                                                   random_state=random_state)
 
@@ -116,7 +127,7 @@ def get_data_loaders(data_path, batch_size, random_state, img_x, img_y, dataset_
         transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
     ])
 
-    test_dataset = Dataset_CRNN(data_path, X_test, Y_test_scaled, Y_test_raw, transform=transform, n_frames=n_frames)
+    test_dataset = Dataset_CRNN(data_path, X_test, Y_test_scaled, Y_test_raw, transform=transform, n_frames=n_frames, groups=G_test)
     test_loader = DataLoader(test_dataset, batch_size=batch_size, shuffle=False, num_workers=0, pin_memory=False)
 
     print(f"**Display: 测试集加载器和标准化器准备就绪。测试样本数: {len(test_dataset)}**")
@@ -152,83 +163,87 @@ def get_model(model_type, n_frames, device, args):
 
 
 def test_model_and_save_results(model, device, test_loader, scaler, model_name, dataset_name, dirs, checkpoint_path):
-    """
-    健壮的测试函数，与训练脚本中的版本功能完全相同。
-    """
     print(f"**Display: 从 {checkpoint_path} 加载模型权重...**")
-
-    # 根据模型结构选择加载方式
-    if hasattr(model, 'decoder'):  # 旧的 Encoder+Decoder 结构
-        print("**Display: 检测到旧模型结构，使用兼容模式加载。**")
-        try:
-            model.load_state_dict(torch.load(checkpoint_path, map_location=device))
-        except RuntimeError:
-            state_dict = torch.load(checkpoint_path, map_location=torch.device('cpu'))
-            model.load_state_dict(state_dict)
-            model.encoder.to(device)
-            model.decoder.to(torch.device('cpu') if model.model_type == 'lstm' else device)
-    else:  # 独立的 VideoTransformer
-        print("**Display: 检测到独立模型结构，使用标准模式加载。**")
-        model.load_state_dict(torch.load(checkpoint_path, map_location=device))
-
+    model.load_state_dict(torch.load(checkpoint_path, map_location=device))
     print(f"**Display: 模型权重加载成功。**")
-
     model.eval()
-    all_predictions_unscaled, all_true_values_unscaled = [], []
-    all_scaled_predictions, all_scaled_true = [], []
+
+    # 使用 defaultdict 来自动处理新遇到的组别
+    results_by_group = defaultdict(lambda: {'preds': [], 'trues': []})
+
+    # 用于最终CSV文件的列表
+    all_preds_unscaled, all_trues_unscaled, all_preds_scaled, all_trues_scaled, all_groups_for_csv = [], [], [], [], []
 
     print("**Display: 开始在测试集上进行评估...**")
     pbar = tqdm(test_loader, total=len(test_loader), desc="Testing")
     with torch.no_grad():
-        for X, y_scale, y_orig in pbar:
+        # Dataloader 现在返回4个值
+        for X, y_scale, y_orig, groups_batch in pbar:
             X = X.to(device, dtype=torch.float32)
             output_scaled = model(X)
             pred_unscaled = scaler.inverse_transform(output_scaled.detach().cpu().numpy())
 
-            all_predictions_unscaled.extend(pred_unscaled.flatten().tolist())
-            all_true_values_unscaled.extend(y_orig.numpy().flatten().tolist())
-            all_scaled_predictions.extend(output_scaled.detach().cpu().numpy().flatten().tolist())
-            all_scaled_true.extend(y_scale.numpy().flatten().tolist())
+            # 按样本处理，以便匹配组别
+            for i in range(len(X)):
+                group_name = groups_batch[i]
+                pred_val = pred_unscaled[i, 0]
+                true_val = y_orig[i, 0]
 
-    # --- 指标计算与结果保存 (与 train_eval.py 完全一致) ---
-    true_np, pred_np = np.array(all_true_values_unscaled), np.array(all_predictions_unscaled)
-    mse = mean_squared_error(true_np, pred_np)
-    rmse = np.sqrt(mse)
-    mae = mean_absolute_error(true_np, pred_np)
-    r2 = r2_score(true_np, pred_np)
-    non_zero_mask = true_np != 0
-    mre = np.mean(np.abs((pred_np[non_zero_mask] - true_np[non_zero_mask]) / true_np[non_zero_mask])) if np.sum(
-        non_zero_mask) > 0 else float('inf')
+                # 收集每个组别的数据
+                results_by_group[group_name]['preds'].append(pred_val)
+                results_by_group[group_name]['trues'].append(true_val)
 
-    print("\n**Display: 测试结果:**")
-    print(f"  **RMSE (unscaled): {rmse:.4f}**")
-    print(f"  **MAE (unscaled): {mae:.4f}**")
-    print(f"  **R² Score: {r2:.4f}**")
-    print(f"  **Mean Relative Error (MRE): {mre * 100:.2f}%**")
+                # 为CSV文件收集所有数据
+                all_preds_unscaled.append(pred_val)
+                all_trues_unscaled.append(true_val)
+                all_preds_scaled.append(output_scaled.detach().cpu().numpy()[i, 0])
+                all_trues_scaled.append(y_scale.numpy()[i, 0])
+                all_groups_for_csv.append(group_name)
 
-    metrics_summary = (f"Test Results for model: {model_name}, dataset: {dataset_name}\n" +
-                       f"Checkpoint: {checkpoint_path}\n" +
-                       f"RMSE (unscaled): {rmse:.4f}\n" +
-                       f"MAE (unscaled): {mae:.4f}\n" +
-                       f"R2 Score: {r2:.4f}\n" +
-                       f"Mean Relative Error (MRE): {mre * 100:.2f}%\n" +
-                       f"Number of test samples: {len(true_np)}\n")
+    print("\n" + "=" * 50)
+    print("           按组别划分的测试结果")
+    print("=" * 50)
 
-    metrics_path = os.path.join(dirs["predictions_dir"], f"{model_name}_{dataset_name}_test_metrics.txt")
-    with open(metrics_path, "w") as f:
-        f.write(metrics_summary)
-    print(f"**Display: 测试指标已保存至: {metrics_path}**")
+    # 定义一个辅助函数来计算和打印指标，避免代码重复
+    def calculate_and_print_metrics(group_name, trues, preds):
+        if not trues:
+            print(f"\n--- 组别: {group_name} (0 个样本) ---")
+            return
 
-    df_predictions = pd.DataFrame({'true_value_unscaled': all_true_values_unscaled,
-                                   'predicted_value_unscaled': all_predictions_unscaled,
-                                   'true_value_scaled': all_scaled_true,
-                                   'predicted_value_scaled': all_scaled_predictions})
+        true_np, pred_np = np.array(trues), np.array(preds)
+        rmse = np.sqrt(mean_squared_error(true_np, pred_np))
+        mae = mean_absolute_error(true_np, pred_np)
+        r2 = r2_score(true_np, pred_np)
 
-    predictions_path = os.path.join(dirs["predictions_dir"], f"{model_name}_{dataset_name}_test_predictions.csv")
+        print(f"\n--- 组别: {group_name} ({len(trues)} 个样本) ---")
+        print(f"  **RMSE (unscaled): {rmse:.4f}**")
+        print(f"  **MAE (unscaled): {mae:.4f}**")
+        print(f"  **R² Score: {r2:.4f}**")
+
+    # 为每个组别计算并打印结果
+    for group in sorted(results_by_group.keys()):
+        data = results_by_group[group]
+        calculate_and_print_metrics(group, data['trues'], data['preds'])
+
+    # 打印总结果
+    print("\n" + "=" * 50)
+    print("               总体测试结果")
+    print("=" * 50)
+    calculate_and_print_metrics("OVERALL", all_trues_unscaled, all_preds_unscaled)
+    print("=" * 50 + "\n")
+
+    # 保存包含组别信息的详细预测结果
+    df_predictions = pd.DataFrame({
+        'group': all_groups_for_csv,
+        'true_value_unscaled': all_trues_unscaled,
+        'predicted_value_unscaled': all_preds_unscaled,
+        'true_value_scaled': all_trues_scaled,
+        'predicted_value_scaled': all_preds_scaled,
+    })
+    predictions_path = os.path.join(dirs["predictions_dir"],
+                                    f"{model_name}_{dataset_name}_test_predictions_by_group.csv")
     df_predictions.to_csv(predictions_path, index=False)
-    print(f"**Display: 详细预测结果已保存至: {predictions_path}**")
-
-
+    print(f"**Display: 按组别划分的详细预测结果已保存至: {predictions_path}**")
 # ===================================================================
 # ---                         主程序入口                          ---
 # ===================================================================

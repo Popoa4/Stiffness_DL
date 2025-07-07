@@ -26,13 +26,14 @@ def cat2labels(label_encoder, y_cat):
 
 ## ---------------------- Dataloaders ---------------------- ##
 class Dataset_CRNN(data.Dataset):
-    def __init__(self, data_path, folders, labels, gt, n_frames = 10, transform=None):
+    def __init__(self, data_path, folders, labels, gt, n_frames = 10, transform=None, groups=None):
         self.data_path = data_path
         self.labels = labels
         self.gt_labels = gt
         self.folders = folders
         self.transform = transform
         self.n_frames = n_frames
+        self.groups = groups
 
     def __len__(self):
         return len(self.folders)
@@ -50,6 +51,7 @@ class Dataset_CRNN(data.Dataset):
                               if f.lower().endswith(('.jpg', '.png'))])
         frame_count = len(frame_files)
         wanted = self.n_frames
+        # print(f'正在读取 {selected_folder} 中的 {wanted} 张图片...')
 
         if frame_count == 0:
             raise RuntimeError(f'Folder {folder_path} 没有任何帧！')
@@ -103,7 +105,9 @@ class Dataset_CRNN(data.Dataset):
         X = self.read_images(self.data_path, folder, self.transform)
         Y_scale = torch.tensor(self.labels[index], dtype=torch.float)
         Y = self.gt_labels[index]
-        return X, Y_scale, Y
+        group = self.groups[index] if self.groups is not None else "N/A"
+
+        return X, Y_scale, Y, group
 
 
 ## -------------------- CRNN prediction ---------------------- ##
@@ -373,7 +377,7 @@ class DecoderTCN(nn.Module):
         return x
 
 
-# ------------- Video Vision Transformer (简化版 ViT + Time) -------------
+# ------------- Video Vision Transformer -------------
 class PatchEmbedding(nn.Module):
     """
     把输入帧 (C,H,W) 切成 (N_patches, embed_dim) 向量
@@ -398,7 +402,6 @@ class PatchEmbedding(nn.Module):
 
 class VideoTransformer(nn.Module):
     """
-    采用时空分离注意力的Video Transformer，灵感来自TimeSformer。
     1. 先在每帧内部做空间注意力。
     2. 再在不同帧之间做时间注意力。
     """

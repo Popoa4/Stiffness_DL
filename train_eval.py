@@ -13,6 +13,7 @@ from sklearn.preprocessing import StandardScaler
 from sklearn.metrics import mean_squared_error, mean_absolute_error, r2_score
 import matplotlib.pyplot as plt
 from tqdm import tqdm
+import re, time
 from timm import create_model
 
 # Import from functions.py
@@ -39,6 +40,8 @@ DATASET_OPTIONS = {
 
 DEF_CHECKPOINT_DIR = "./checkpoints"
 DEF_RESULTS_DIR = "./results"
+
+SHAPES_ALL = ['FLAT','EDGE','CORNER','SPHERE','CYLIND','BASIC','CHOCO']
 
 # Architecture Params (from original hardness_CRNN_fixed.py)
 CNN_FC_HIDDEN1, CNN_FC_HIDDEN2 = 512, 348
@@ -679,6 +682,9 @@ if __name__ == '__main__':
     parser.add_argument('--log_interval', type=int, default=LOG_INTERVAL,
                         help=f"Log training progress every N batches (default: {LOG_INTERVAL}).")
     parser.add_argument('--n_frames', type=int, default=10, help="Number of frames per sample (default: 10).")
+    parser.add_argument('--experiment', required=True,
+                        choices=['1', '2', '3_basic', '3_choco'],
+                        help='Which experiment setting to run')
 
     parsed_args = parser.parse_args()
 
