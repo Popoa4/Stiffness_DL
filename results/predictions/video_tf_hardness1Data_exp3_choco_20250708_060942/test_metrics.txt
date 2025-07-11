@@ -1,0 +1,7 @@
+Test Results for run: video_tf_hardness1Data_exp3_choco_20250708_060942
+Checkpoint: ./checkpoints/video_tf_hardness1Data_exp3_choco_20250708_060942/best_model.pth
+RMSE (unscaled): 28.7154
+MAE (unscaled): 23.4127
+R2 Score: -0.1705
+Mean Relative Error (MRE): 116.30%
+Number of test samples: 1789

@@ -1,0 +1,7 @@
+Test Results for run: video_tf_hardness1Data_exp1_20250707_224953
+Checkpoint: ./checkpoints/video_tf_hardness1Data_exp1_20250707_224953/best_model.pth
+RMSE (unscaled): 21.1884
+MAE (unscaled): 19.6240
+R2 Score: 0.0000
+Mean Relative Error (MRE): 54.51%
+Number of test samples: 10

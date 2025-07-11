@@ -25,6 +25,36 @@ def cat2labels(label_encoder, y_cat):
 
 
 ## ---------------------- Dataloaders ---------------------- ##
+class PreprocessedDataset(data.Dataset):
+    def __init__(self, preprocessed_path, folders, labels, gt_labels):
+        """
+        preprocessed_path: 预处理数据（.pt文件）所在的文件夹
+        folders: 样本文件夹名称列表 (例如 ['FLAT_hard_17_xxx', ...])
+        labels: 标准化后的标签数组
+        gt_labels: 原始标签数组
+        """
+        self.preprocessed_path = preprocessed_path
+        self.folders = folders
+        self.labels = labels
+        self.gt_labels = gt_labels
+
+    def __len__(self):
+        return len(self.folders)
+
+    def __getitem__(self, index):
+        folder_name = self.folders[index]
+        file_path = os.path.join(self.preprocessed_path, f"{folder_name}.pt")
+
+        # 这是唯一需要的I/O操作，非常快
+        saved_data = torch.load(file_path)
+
+        X = saved_data['data']  # 直接获取处理好的Tensor
+        Y_scale = torch.tensor(self.labels[index], dtype=torch.float)
+        Y = self.gt_labels[index]
+
+        # 注意：这里我们不再需要group，可以简化返回
+        return X, Y_scale, Y
+
 class Dataset_CRNN(data.Dataset):
     def __init__(self, data_path, folders, labels, gt, n_frames = 10, transform=None, groups=None):
         self.data_path = data_path
